@@ -6,15 +6,19 @@ choosing a different adapter.
 
 ## 1. Global and scoped tool policy
 
-The existing global tool policy remains the outer boundary. Scoped grants add
-least-privilege rules for a chat, channel, or runtime principal:
+The global tool policy is the outer boundary. It is evaluated at the single
+registry choke point (`ToolRegistry::execute_with_auth`), so main-agent,
+sub-agent, scheduler and plugin calls are all covered, and tools it blocks
+are also left out of the catalog sent to the model
+(`ToolRegistry::definitions_for`). Scoped grants add least-privilege rules
+for a chat, channel, or runtime principal:
 
 ```yaml
 tool_policy:
   mode: block
-  deny_tools: []
-  max_risk: high
-  allow_tools: []
+  allow_tools: [read_file, glob, grep, web_*]   # allowlist (empty = no restriction)
+  deny_tools: [bash]                            # always blocked, wins over allow
+  max_risk: medium                              # risk ceiling, also for allow-listed tools
 
   grants_mode: block
   control_chat_bypass: true
@@ -32,6 +36,28 @@ tool_policy:
       max_risk: medium
 ```
 
+Global rule behavior (`mode: warn | block`; `off` evaluates nothing):
+
+- Every rule only removes tools; none widens. Evaluation order is
+  `deny_tools`, then `allow_tools`, then `max_risk`.
+- `deny_tools` always blocks, even for a tool that is also in `allow_tools`.
+- A non-empty `allow_tools` is an allowlist: every tool not listed is a
+  violation. An empty list means "no allowlist", not "allow nothing".
+- `max_risk` blocks tools above the tier even when they are allow-listed. To
+  permit a high-risk tool, raise or unset `max_risk`.
+- All tool lists, global and per grant, accept `*` and trailing wildcards
+  such as `mcp_*`.
+- `mode: block` with no `allow_tools`, `deny_tools` or `max_risk` restricts
+  nothing. `microclaw doctor` (`security.tool_policy`) and
+  `microclaw config check` warn about that configuration.
+- Under `block`, blocked tools are not offered to the model at all; under
+  `warn`, every tool stays in the catalog and violations are audited.
+
+Before 0.11.1 the global `allow_tools` was an *exemption* list (it lifted
+`deny_tools` / `max_risk` for the listed tools) and global lists were
+exact-match only, so `allow_tools: [read_file]` on its own restricted
+nothing. See the 0.11.1 changelog entry.
+
 Principals currently include:
 
 - `main`;
@@ -40,14 +66,13 @@ Principals currently include:
 - `subagent:<run_id>`;
 - future TypeScript plugins: `plugin:<plugin_id>`.
 
-Rule behavior:
+Grant rule behavior:
 
 - A global block always wins; a scoped grant cannot weaken it.
 - `grants_mode: off` preserves historical behavior.
 - No matching rule is a violation when grants are active.
 - All matching rules are combined conservatively: any deny or exceeded risk
   blocks; at least one matching allow is required.
-- Tool lists support `*` and trailing wildcards.
 - `control_chat_bypass` bypasses only scoped grants, never the global policy.
 - Warn/block decisions include principal identity in the audit actor.
 

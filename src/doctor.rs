@@ -527,6 +527,53 @@ fn check_secure_runtime_policy(report: &mut DoctorReport) {
         Ok(config) => config,
         Err(_) => return,
     };
+    let policy = &config.tool_policy;
+    let policy_off = policy.mode == crate::tool_guardrails::ToolPolicyMode::Off;
+    let policy_empty = crate::tool_guardrails::global_policy_has_no_rules(policy);
+    report.push(
+        "security.tool_policy",
+        "Global tool policy",
+        if policy_off || policy_empty {
+            CheckStatus::Warn
+        } else {
+            CheckStatus::Pass
+        },
+        format!(
+            "mode={:?}; allow_tools={}; deny_tools={}; max_risk={}",
+            policy.mode,
+            if policy.allow_tools.is_empty() {
+                "(none: every tool)".to_string()
+            } else {
+                policy.allow_tools.join(",")
+            },
+            if policy.deny_tools.is_empty() {
+                "(none)".to_string()
+            } else {
+                policy.deny_tools.join(",")
+            },
+            policy
+                .max_risk
+                .map_or("unrestricted".to_string(), |r| r.as_str().to_string())
+        )
+        .to_ascii_lowercase(),
+        if policy_off {
+            Some(
+                "Set tool_policy.mode to warn or block and restrict tools with allow_tools \
+                 (allowlist), deny_tools or max_risk."
+                    .to_string(),
+            )
+        } else if policy_empty {
+            Some(
+                "tool_policy.mode is on but allow_tools, deny_tools and max_risk are all \
+                 empty, so every tool is still permitted. Add an allowlist, a deny list \
+                 or a max_risk ceiling."
+                    .to_string(),
+            )
+        } else {
+            None
+        },
+    );
+
     let grants_enabled =
         config.tool_policy.grants_mode != crate::tool_guardrails::ToolPolicyMode::Off;
     report.push(
@@ -2036,6 +2083,58 @@ mod tests {
         std::env::remove_var("MICROCLAW_CONFIG");
         let _ = std::fs::remove_file(path);
         assert!(report.checks.iter().any(|c| c.id == "sandbox.mode"));
+    }
+
+    #[test]
+    fn test_build_sandbox_report_flags_tool_policy_without_rules() {
+        let _guard = env_lock();
+        let path = std::env::temp_dir().join(format!(
+            "microclaw_doctor_tool_policy_{}.yaml",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let mut cfg = Config::test_defaults();
+        cfg.tool_policy.mode = crate::tool_guardrails::ToolPolicyMode::Block;
+        cfg.save_yaml(path.to_string_lossy().as_ref()).unwrap();
+        std::env::set_var("MICROCLAW_CONFIG", &path);
+        let report = build_sandbox_report();
+        std::env::remove_var("MICROCLAW_CONFIG");
+        let _ = std::fs::remove_file(path);
+
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.id == "security.tool_policy")
+            .expect("tool policy check present");
+        assert!(matches!(check.status, CheckStatus::Warn));
+        assert!(check
+            .fix
+            .as_deref()
+            .is_some_and(|fix| fix.contains("every tool is still permitted")));
+    }
+
+    #[test]
+    fn test_build_sandbox_report_passes_tool_policy_with_allowlist() {
+        let _guard = env_lock();
+        let path = std::env::temp_dir().join(format!(
+            "microclaw_doctor_tool_policy_ok_{}.yaml",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let mut cfg = Config::test_defaults();
+        cfg.tool_policy.mode = crate::tool_guardrails::ToolPolicyMode::Block;
+        cfg.tool_policy.allow_tools = vec!["read_file".to_string()];
+        cfg.save_yaml(path.to_string_lossy().as_ref()).unwrap();
+        std::env::set_var("MICROCLAW_CONFIG", &path);
+        let report = build_sandbox_report();
+        std::env::remove_var("MICROCLAW_CONFIG");
+        let _ = std::fs::remove_file(path);
+
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.id == "security.tool_policy")
+            .expect("tool policy check present");
+        assert!(matches!(check.status, CheckStatus::Pass));
+        assert!(check.detail.contains("allow_tools=read_file"));
     }
 
     #[test]

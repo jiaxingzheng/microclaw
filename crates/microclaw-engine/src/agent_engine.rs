@@ -2054,13 +2054,32 @@ async fn process_with_agent_logic(
     }
 
     let learning_foundry_mode = context.caller_channel == "learning_foundry";
+    let mut skill_env_files: Vec<String> = {
+        let db = state.db.clone();
+        call_blocking(db, move |db| db.load_session_skill_envs(chat_id))
+            .await?
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default()
+    };
+    let mut tool_auth = ToolAuthContext {
+        caller_channel: context.caller_channel.to_string(),
+        caller_chat_id: chat_id,
+        principal: if learning_foundry_mode {
+            "learning_foundry".to_string()
+        } else {
+            "main".to_string()
+        },
+        control_chat_ids: state.config.control_chat_ids.clone(),
+        env_files: skill_env_files.clone(),
+    };
+    // Catalog already narrowed by the operator's tool_policy: tools the
+    // choke point would block are not offered to the model at all.
+    let available_tools = state.tools.definitions_for(&tool_auth);
     let profile_read_only = runtime_profile
         .as_ref()
         .is_some_and(|profile| profile.tool_policy == ToolPolicy::ReadOnly);
     let tool_defs = if profile_read_only {
-        state
-            .tools
-            .definitions()
+        available_tools
             .iter()
             .filter(|definition| {
                 matches!(
@@ -2074,9 +2093,7 @@ async fn process_with_agent_logic(
             .collect()
     } else if plan_mode_active {
         // Read-only research tools only — nothing that mutates state.
-        state
-            .tools
-            .definitions()
+        available_tools
             .iter()
             .filter(|definition| {
                 matches!(
@@ -2089,9 +2106,7 @@ async fn process_with_agent_logic(
             .cloned()
             .collect()
     } else if learning_foundry_mode {
-        state
-            .tools
-            .definitions()
+        available_tools
             .into_iter()
             .filter(|definition| {
                 matches!(
@@ -2112,7 +2127,7 @@ async fn process_with_agent_logic(
             })
             .collect()
     } else {
-        state.tools.definitions().to_vec()
+        available_tools
     };
     let profile_allowed_tools = profile_read_only.then(|| {
         tool_defs
@@ -2120,24 +2135,6 @@ async fn process_with_agent_logic(
             .map(|definition| definition.name.clone())
             .collect::<std::collections::HashSet<_>>()
     });
-    let mut skill_env_files: Vec<String> = {
-        let db = state.db.clone();
-        call_blocking(db, move |db| db.load_session_skill_envs(chat_id))
-            .await?
-            .and_then(|json| serde_json::from_str(&json).ok())
-            .unwrap_or_default()
-    };
-    let mut tool_auth = ToolAuthContext {
-        caller_channel: context.caller_channel.to_string(),
-        caller_chat_id: chat_id,
-        principal: if learning_foundry_mode {
-            "learning_foundry".to_string()
-        } else {
-            "main".to_string()
-        },
-        control_chat_ids: state.config.control_chat_ids.clone(),
-        env_files: skill_env_files.clone(),
-    };
 
     // Agentic tool-use loop
     let mut failed_tools: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();

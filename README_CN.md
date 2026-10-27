@@ -68,7 +68,7 @@ brew install --cask microclaw-work
 ```
 
 Linux x86_64/arm64 与 Windows x86_64 portable 预览包可从
-[v0.11.0 版本页面](https://github.com/microclaw/microclaw/releases/tag/v0.11.0)下载。
+[v0.11.1 版本页面](https://github.com/microclaw/microclaw/releases/tag/v0.11.1)下载。
 macOS 仍是 Work 当前正式支持的桌面平台，其他平台继续完成验收。
 
 如需运行 MicroClaw Server，在 macOS 或 Linux 上安装：
@@ -93,7 +93,7 @@ microclaw start
 
 然后打开 [http://127.0.0.1:10961](http://127.0.0.1:10961)。
 
-最新版本为 **v0.11.0**。MicroClaw Work 可以与你自己部署的 Server 配对：Web 控制台生成一次性配对码，Work 换取可随时撤销的设备令牌，并通过明确的「本地 / Server」执行目标把任务交给 Server 运行，进度、取消和审批与本地一致。同时清理了最新的 zip、rustls、quinn 安全公告。详情见[更新日志](CHANGELOG.md)与[版本下载](https://github.com/microclaw/microclaw/releases/tag/v0.11.0)。
+最新版本为 **v0.11.1**，是一个安全补丁：全局 `tool_policy.allow_tools` 现在是真正的白名单（此前只是豁免名单，单独配置时不会限制任何工具），全局工具列表支持 `*` 通配，发给模型的工具目录会按策略过滤，`microclaw doctor` 会提示没有规则的空策略。详情见[更新日志](CHANGELOG.md)与[版本下载](https://github.com/microclaw/microclaw/releases/tag/v0.11.1)。
 
 Homebrew、Docker、源码构建、Linux 兼容性、升级和常驻服务安装请查看[快速上手指南](docs/getting-started.md)。
 
@@ -142,7 +142,7 @@ Web 控制台、具体渠道适配器或 Work UI。
 
 ```toml
 [dependencies]
-microclaw-sdk = { version = "0.11.0", features = ["full"] }
+microclaw-sdk = { version = "0.11.1", features = ["full"] }
 ```
 
 ```rust

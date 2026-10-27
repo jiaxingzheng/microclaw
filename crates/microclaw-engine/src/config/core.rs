@@ -1349,6 +1349,12 @@ impl Config {
             config.web_enabled = true;
         }
         config.post_deserialize()?;
+        if crate::tool_guardrails::global_policy_has_no_rules(&config.tool_policy) {
+            tracing::warn!(
+                "tool_policy.mode is on but allow_tools, deny_tools and max_risk are all empty: \
+                 every tool is still permitted. Add an allowlist, a deny list or a max_risk ceiling."
+            );
+        }
         if synthesized_channel {
             config.web_enabled = false;
             config.channels.remove("web");
@@ -2276,6 +2282,16 @@ pub fn check_config_content(path_str: &str, content: &str) -> ConfigCheckReport 
             // Covers value validation including the "no channel enabled" case.
             Err(e) => report.errors.push(e.to_string()),
             Ok(()) => {
+                if crate::tool_guardrails::global_policy_has_no_rules(&config.tool_policy) {
+                    report.warnings.push(format!(
+                        "tool_policy.mode is `{}` but allow_tools, deny_tools and max_risk are all \
+                         empty, so every tool is still permitted. Add an allowlist, a deny list \
+                         or a max_risk ceiling.",
+                        serde_yaml::to_string(&config.tool_policy.mode)
+                            .unwrap_or_default()
+                            .trim()
+                    ));
+                }
                 let (enabled, disabled) = config.channel_status();
                 report.summary = Some((
                     enabled,
@@ -2530,6 +2546,35 @@ mod tests {
             "expected did-you-mean on enum typo, got: {:?}",
             report.errors
         );
+    }
+
+    #[test]
+    fn config_check_warns_when_tool_policy_has_no_rules() {
+        let report = check_config_content("t.yaml", "api_key: key\ntool_policy:\n  mode: block\n");
+        assert!(report.ok(), "errors: {:?}", report.errors);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("tool_policy.mode is `block`")
+                    && w.contains("every tool is still permitted")),
+            "expected empty-policy warning, got: {:?}",
+            report.warnings
+        );
+
+        // Any rule silences it.
+        let report = check_config_content(
+            "t.yaml",
+            "api_key: key\ntool_policy:\n  mode: block\n  allow_tools: [read_file]\n",
+        );
+        assert!(report.ok(), "errors: {:?}", report.errors);
+        assert!(
+            !report.warnings.iter().any(|w| w.contains("tool_policy")),
+            "unexpected warning: {:?}",
+            report.warnings
+        );
+        let report = check_config_content("t.yaml", "api_key: key\n");
+        assert!(!report.warnings.iter().any(|w| w.contains("tool_policy")));
     }
 
     #[test]

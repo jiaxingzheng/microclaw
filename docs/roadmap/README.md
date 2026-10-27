@@ -8,6 +8,7 @@ plan exists first.
 
 | Document | Status | Notes |
 |---|---|---|
+| [`v0.11.1-plan.md`](./v0.11.1-plan.md) | In progress | Security patch: global `tool_policy.allow_tools` is a real allowlist with wildcards, the tool catalog is filtered by policy, and doctor / config check flag an empty policy. |
 | [`v0.11.0-plan.md`](./v0.11.0-plan.md) | Delivered | Web UI dependency release: `@assistant-ui/react` 0.15 without the tap pin, tool-call cards with arguments, Playwright browser smoke test in CI. |
 | [`v0.10.1-plan.md`](./v0.10.1-plan.md) | Delivered | Web UI hotfix: pin `@assistant-ui/tap` to 0.9.12 so the composer no longer crashes on the first keystroke (#517). |
 | [`v0.10.0-plan.md`](./v0.10.0-plan.md) | Delivered | Work ↔ Server pairing shipped: revocable device credentials, remote task submission/progress/cancel, explicit Local/Server execution target in Work; zip 9 / rustls / quinn advisories cleared. |

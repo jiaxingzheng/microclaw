@@ -349,7 +349,7 @@ export function GovernancePanel() {
                 </Select.Root>
               </Flex>
               <div>
-                <Text size="1" color="gray">deny tools (comma separated)</Text>
+                <Text size="1" color="gray">deny tools — always blocked, wins over allow (comma separated, trailing * wildcards)</Text>
                 <TextField.Root
                   className="mt-1"
                   value={denyTools}
@@ -358,12 +358,12 @@ export function GovernancePanel() {
                 />
               </div>
               <div>
-                <Text size="1" color="gray">allow tools — exempt from deny/max-risk (comma separated)</Text>
+                <Text size="1" color="gray">allow tools — allowlist: when set, only these may run (comma separated, trailing * wildcards)</Text>
                 <TextField.Root
                   className="mt-1"
                   value={allowTools}
                   onChange={(e) => setAllowTools(e.target.value)}
-                  placeholder="read_file"
+                  placeholder="read_file, grep, web_*"
                 />
               </div>
               <Flex align="center" gap="3" wrap="wrap">

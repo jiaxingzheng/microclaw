@@ -597,7 +597,7 @@ async fn run_sub_agent_task(
     // The sub-agent's normal tools plus a synthetic `submit_result` tool used to
     // return the final structured result as validated tool input (native
     // constrained decoding) rather than hand-written JSON text.
-    let mut tool_defs = tools.definitions().to_vec();
+    let mut tool_defs = tools.definitions_for(&auth_context);
     tool_defs.push(submit_result_tool_definition());
 
     let profile = crate::tools::specialists::resolve_specialist(Some(specialist.as_str()));

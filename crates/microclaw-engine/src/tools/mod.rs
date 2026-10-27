@@ -687,6 +687,30 @@ impl ToolRegistry {
         out
     }
 
+    /// The catalog `auth` is actually allowed to use: [`Self::definitions`]
+    /// minus every tool whose call `execute_with_auth` would block under the
+    /// operator's `tool_policy` (global rules and capability grants). The
+    /// model is not offered what it cannot run, and a denied tool's existence
+    /// is not advertised. Warn-mode violations stay visible: the call runs
+    /// and is audited. This is advisory only; the choke point in
+    /// `execute_with_auth` still enforces the policy on every call.
+    pub fn definitions_for(&self, auth: &ToolAuthContext) -> Vec<ToolDefinition> {
+        self.definitions()
+            .into_iter()
+            .filter(|definition| {
+                !matches!(
+                    crate::tool_guardrails::evaluate_tool_policy_for_auth_with_risk(
+                        &self.config.tool_policy,
+                        &definition.name,
+                        auth,
+                        self.effective_tool_risk(&definition.name),
+                    ),
+                    crate::tool_guardrails::PolicyDecision::Block(_)
+                )
+            })
+            .collect()
+    }
+
     pub async fn execute(&self, name: &str, input: serde_json::Value) -> ToolResult {
         for tool in &self.tools {
             if tool.name() == name {
@@ -1484,6 +1508,95 @@ tools:
         assert!(result.content.contains("plugin-ok"));
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_definitions_for_hides_policy_blocked_tools() {
+        let mut config = crate::config::Config::test_defaults();
+        config.tool_policy.mode = crate::tool_guardrails::ToolPolicyMode::Block;
+        config.tool_policy.allow_tools = vec!["read_*".to_string()];
+        let tools: Vec<Box<dyn Tool>> = ["read_file", "bash", "write_file"]
+            .into_iter()
+            .map(|name| {
+                Box::new(CaptureInputTool {
+                    tool_name: name.to_string(),
+                }) as Box<dyn Tool>
+            })
+            .collect();
+        let registry = ToolRegistry {
+            config,
+            sandbox_mode: SandboxMode::Off,
+            sandbox_runtime_available: false,
+            cached_static_definitions: OnceLock::new(),
+            audit_db: None,
+            risk_overrides: std::collections::HashMap::new(),
+            tools,
+        };
+        let auth = ToolAuthContext {
+            caller_channel: "telegram".into(),
+            caller_chat_id: 1,
+            principal: "main".into(),
+            control_chat_ids: vec![],
+            env_files: vec![],
+        };
+
+        // The full catalog is untouched; the policy-aware view drops what
+        // the choke point would block.
+        assert_eq!(registry.definitions().len(), 3);
+        let visible: Vec<String> = registry
+            .definitions_for(&auth)
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        assert_eq!(visible, vec!["read_file".to_string()]);
+
+        // Warn mode keeps every tool visible (the call runs, audited).
+        let mut warn_registry = registry;
+        warn_registry.config.tool_policy.mode = crate::tool_guardrails::ToolPolicyMode::Warn;
+        assert_eq!(warn_registry.definitions_for(&auth).len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_allow_list_blocks_unlisted_tool_at_choke_point() {
+        // The regression behind the 0.11.1 advisory: `allow_tools` alone used
+        // to restrict nothing. Now an unlisted tool is blocked before it runs.
+        let mut config = crate::config::Config::test_defaults();
+        config.tool_policy.mode = crate::tool_guardrails::ToolPolicyMode::Block;
+        config.tool_policy.allow_tools = vec!["read_file".to_string()];
+        let registry = ToolRegistry {
+            config,
+            sandbox_mode: SandboxMode::Off,
+            sandbox_runtime_available: false,
+            cached_static_definitions: OnceLock::new(),
+            audit_db: None,
+            risk_overrides: std::collections::HashMap::new(),
+            tools: vec![
+                Box::new(CaptureInputTool {
+                    tool_name: "write_file".into(),
+                }),
+                Box::new(CaptureInputTool {
+                    tool_name: "read_file".into(),
+                }),
+            ],
+        };
+        let auth = ToolAuthContext {
+            caller_channel: "telegram".into(),
+            caller_chat_id: 1,
+            principal: "main".into(),
+            control_chat_ids: vec![],
+            env_files: vec![],
+        };
+        let blocked = registry
+            .execute_with_auth("write_file", json!({}), &auth)
+            .await;
+        assert!(blocked.is_error);
+        assert_eq!(blocked.error_type.as_deref(), Some("tool_policy_blocked"));
+        assert!(blocked.content.contains("not in tool_policy.allow_tools"));
+
+        let allowed = registry
+            .execute_with_auth("read_file", json!({}), &auth)
+            .await;
+        assert!(!allowed.is_error, "{}", allowed.content);
     }
 
     #[tokio::test]

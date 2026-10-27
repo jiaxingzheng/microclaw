@@ -4,7 +4,35 @@ All notable changes to this project should be recorded in this file.
 
 The format is loosely based on Keep a Changelog. Dates use UTC.
 
-## Unreleased
+## 0.11.1 - 2026-10-25
+
+### Security
+
+- `tool_policy.allow_tools` is now a real allowlist. Before, the global
+  list was only an *exemption* from `deny_tools` / `max_risk`, so a config
+  such as `mode: block, allow_tools: [read_file]` with no deny list
+  restricted nothing, and the catalog sent to the model was never filtered
+  by the policy, so the agent kept being offered tools the operator believed
+  were off. Reported privately by nilo (nilo85). Now:
+  - a non-empty global `allow_tools` blocks (or warns about, under
+    `mode: warn`) every tool not listed; an empty list keeps the old
+    "no allowlist" meaning;
+  - `deny_tools` wins over `allow_tools`, and `max_risk` applies to
+    allow-listed tools too, so each rule only ever removes tools;
+  - global `allow_tools` / `deny_tools` accept `*` and trailing wildcards
+    (`mcp_*`), as grant lists already did; previously a wildcard in a
+    global list silently matched nothing;
+  - the tool catalog sent to the model (main loop and sub-agent loop) is
+    narrowed to what the policy lets the caller run
+    (`ToolRegistry::definitions_for`); the choke point in
+    `execute_with_auth` still enforces the policy on every call;
+  - `microclaw doctor` gains a `security.tool_policy` check and
+    `microclaw config check` warns when `tool_policy.mode` is on but
+    `allow_tools`, `deny_tools` and `max_risk` are all empty.
+
+  Operators who relied on the old exemption semantics (listing a tool in
+  `allow_tools` to lift a `deny_tools` or `max_risk` rule for it) must
+  remove it from `deny_tools` or raise `max_risk` instead.
 
 ### Removed
 

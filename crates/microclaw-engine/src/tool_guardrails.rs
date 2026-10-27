@@ -46,15 +46,21 @@ pub enum ToolPolicyMode {
 pub struct ToolPolicyConfig {
     #[serde(default)]
     pub mode: ToolPolicyMode,
-    /// Tool names that are always denied (subject to `mode`).
+    /// Tool names that are always denied (subject to `mode`). Supports `*`
+    /// and trailing wildcards (`mcp_*`). Deny always wins over `allow_tools`.
     #[serde(default)]
     pub deny_tools: Vec<String>,
     /// Highest permitted risk tier: low | medium | high. Tools whose built-in
-    /// risk exceeds this are denied. Unset = all tiers permitted. Typos are
-    /// rejected at config load (typed enum).
+    /// risk exceeds this are denied, whether or not they are in
+    /// `allow_tools`. Unset = all tiers permitted. Typos are rejected at
+    /// config load (typed enum).
     #[serde(default)]
     pub max_risk: Option<ToolRisk>,
-    /// Tool names exempt from `deny_tools` / `max_risk` (allow wins).
+    /// Allowlist. When non-empty, only the listed tools may run; every other
+    /// tool is a violation (subject to `mode`). Supports `*` and trailing
+    /// wildcards. Empty = every tool not removed by `deny_tools` /
+    /// `max_risk`. Each rule only ever removes tools: listing a tool here
+    /// never overrides `deny_tools` or `max_risk`.
     #[serde(default)]
     pub allow_tools: Vec<String>,
     /// Per-chat/per-principal capability enforcement. Separate from the
@@ -132,11 +138,14 @@ pub fn evaluate_tool_policy_with_risk(
     if cfg.mode == ToolPolicyMode::Off {
         return PolicyDecision::Allow;
     }
-    if cfg.allow_tools.iter().any(|t| t == tool_name) {
-        return PolicyDecision::Allow;
-    }
-    let violation = if cfg.deny_tools.iter().any(|t| t == tool_name) {
+    // Every rule only removes tools; none widens. Deny first, then the
+    // allowlist (when one is configured), then the risk ceiling.
+    let violation = if tool_list_contains(&cfg.deny_tools, tool_name) {
         Some(format!("tool `{tool_name}` is in tool_policy.deny_tools"))
+    } else if !cfg.allow_tools.is_empty() && !tool_list_contains(&cfg.allow_tools, tool_name) {
+        Some(format!(
+            "tool `{tool_name}` is not in tool_policy.allow_tools"
+        ))
     } else {
         match cfg.max_risk {
             Some(max_risk) if risk > max_risk => Some(format!(
@@ -157,6 +166,17 @@ pub fn evaluate_tool_policy_with_risk(
             }
         }
     }
+}
+
+/// True when `mode` is `warn`/`block` but no `deny_tools`, `allow_tools` or
+/// `max_risk` is set, i.e. the global policy is switched on yet permits every
+/// tool. Surfaced by `microclaw doctor` and `microclaw config check` so an
+/// operator who believes they restricted tools finds out that they did not.
+pub fn global_policy_has_no_rules(cfg: &ToolPolicyConfig) -> bool {
+    cfg.mode != ToolPolicyMode::Off
+        && cfg.deny_tools.is_empty()
+        && cfg.allow_tools.is_empty()
+        && cfg.max_risk.is_none()
 }
 
 /// Evaluate the global policy and the caller's least-privilege capability
@@ -445,12 +465,98 @@ mod tests {
     }
 
     #[test]
-    fn policy_allow_list_overrides_deny() {
+    fn policy_allow_list_restricts_to_listed_tools() {
+        // A non-empty allow_tools is an allowlist: everything not listed is
+        // a violation, even with no deny_tools / max_risk configured.
+        let mut c = cfg(ToolPolicyMode::Block);
+        c.allow_tools = vec!["read_file".into(), "web_*".into()];
+        assert_eq!(evaluate_tool_policy(&c, "read_file"), PolicyDecision::Allow);
+        assert_eq!(
+            evaluate_tool_policy(&c, "web_search"),
+            PolicyDecision::Allow
+        );
+        match evaluate_tool_policy(&c, "bash") {
+            PolicyDecision::Block(reason) => {
+                assert!(
+                    reason.contains("not in tool_policy.allow_tools"),
+                    "{reason}"
+                )
+            }
+            other => panic!("expected block, got {other:?}"),
+        }
+        assert!(matches!(
+            evaluate_tool_policy(&c, "write_file"),
+            PolicyDecision::Block(_)
+        ));
+        // Warn mode reports the same violation without blocking.
+        c.mode = ToolPolicyMode::Warn;
+        assert!(matches!(
+            evaluate_tool_policy(&c, "bash"),
+            PolicyDecision::Warn(_)
+        ));
+    }
+
+    #[test]
+    fn policy_empty_allow_list_permits_everything_not_denied() {
         let mut c = cfg(ToolPolicyMode::Block);
         c.deny_tools = vec!["bash".into()];
+        assert_eq!(evaluate_tool_policy(&c, "read_file"), PolicyDecision::Allow);
+        assert_eq!(
+            evaluate_tool_policy(&c, "write_file"),
+            PolicyDecision::Allow
+        );
+    }
+
+    #[test]
+    fn policy_deny_wins_over_allow() {
+        let mut c = cfg(ToolPolicyMode::Block);
+        c.deny_tools = vec!["bash".into()];
+        c.allow_tools = vec!["bash".into(), "read_file".into()];
+        assert!(matches!(
+            evaluate_tool_policy(&c, "bash"),
+            PolicyDecision::Block(_)
+        ));
+        assert_eq!(evaluate_tool_policy(&c, "read_file"), PolicyDecision::Allow);
+    }
+
+    #[test]
+    fn policy_allow_list_does_not_lift_max_risk() {
+        let mut c = cfg(ToolPolicyMode::Block);
         c.max_risk = Some(ToolRisk::Low);
-        c.allow_tools = vec!["bash".into()];
+        c.allow_tools = vec!["bash".into(), "read_file".into()];
+        assert!(matches!(
+            evaluate_tool_policy(&c, "bash"),
+            PolicyDecision::Block(_)
+        ));
+        assert_eq!(evaluate_tool_policy(&c, "read_file"), PolicyDecision::Allow);
+    }
+
+    #[test]
+    fn policy_global_lists_support_wildcards() {
+        let mut c = cfg(ToolPolicyMode::Block);
+        c.deny_tools = vec!["mcp_*".into()];
+        assert!(matches!(
+            evaluate_tool_policy(&c, "mcp_fs_delete_file"),
+            PolicyDecision::Block(_)
+        ));
+        assert_eq!(evaluate_tool_policy(&c, "read_file"), PolicyDecision::Allow);
+
+        let mut c = cfg(ToolPolicyMode::Block);
+        c.allow_tools = vec!["*".into()];
         assert_eq!(evaluate_tool_policy(&c, "bash"), PolicyDecision::Allow);
+    }
+
+    #[test]
+    fn policy_without_rules_is_flagged() {
+        assert!(!global_policy_has_no_rules(&cfg(ToolPolicyMode::Off)));
+        assert!(global_policy_has_no_rules(&cfg(ToolPolicyMode::Block)));
+        assert!(global_policy_has_no_rules(&cfg(ToolPolicyMode::Warn)));
+        let mut c = cfg(ToolPolicyMode::Block);
+        c.allow_tools = vec!["read_file".into()];
+        assert!(!global_policy_has_no_rules(&c));
+        let mut c = cfg(ToolPolicyMode::Block);
+        c.max_risk = Some(ToolRisk::High);
+        assert!(!global_policy_has_no_rules(&c));
     }
 
     #[test]

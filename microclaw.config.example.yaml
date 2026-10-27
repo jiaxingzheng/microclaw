@@ -107,14 +107,19 @@ timezone: "UTC"
 # Pre-tool-call policy — a hard gate evaluated before every tool call.
 # Off by default (no behavior change). `warn` executes the call but seals a
 # violation entry into the tamper-evident audit log; `block` short-circuits
-# the call with an error tool_result and audits it. `allow_tools` wins over
-# `deny_tools`/`max_risk`. `max_risk` denies tools above the given built-in
-# risk tier (low < medium < high); an invalid value fails closed.
+# the call with an error tool_result and audits it. Each rule only removes
+# tools: `deny_tools` always blocks (and wins over `allow_tools`);
+# `allow_tools`, when non-empty, is an allowlist and every unlisted tool is
+# blocked; `max_risk` denies tools above the given built-in risk tier
+# (low < medium < high) even when they are allow-listed. All lists accept
+# `*` and trailing wildcards (`mcp_*`). Tools the policy blocks are also
+# left out of the catalog sent to the model. `microclaw doctor` and
+# `microclaw config check` warn when `mode` is on but no rule is set.
 # tool_policy:
 #   mode: block
 #   deny_tools: [bash]
 #   max_risk: medium
-#   allow_tools: []
+#   allow_tools: []            # e.g. [read_file, grep, glob, web_*]
 #   grants_mode: block
 #   control_chat_bypass: true
 #   grants:
