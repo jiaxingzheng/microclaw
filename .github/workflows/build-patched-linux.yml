@@ -46,6 +46,9 @@ jobs:
         with:
           shared-key: patched-linux-x86_64-default
 
+      - name: Run feishu channel tests
+        run: cargo test --release --lib channels::feishu
+
       - name: Build release binary
         run: cargo build --release
 

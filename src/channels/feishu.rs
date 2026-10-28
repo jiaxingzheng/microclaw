@@ -1022,6 +1022,28 @@ fn is_feishu_edit_limit(err: &str) -> bool {
     err.contains("code=2200")
 }
 
+/// Render the body of a progress/status message.
+///
+/// `window_start` is the index of the first accumulated line shown in this
+/// message. A continuation message deliberately does **not** replay the whole
+/// transcript: it shows only its own window and states how many earlier lines
+/// live in the previous message. Replaying everything produced N near-identical
+/// copies of the same history and renumbered the turn from scratch each time.
+fn render_status_body(prefix: &str, lines: &[String], window_start: usize) -> String {
+    let start = window_start.min(lines.len());
+    let mut out = String::new();
+    out.push_str(prefix);
+    out.push('\n');
+    if start > 0 {
+        out.push_str(&format!(
+            "（续，前 {} 行见上一条消息）\n",
+            start
+        ));
+    }
+    out.push_str(&lines[start..].join("\n"));
+    out
+}
+
 /// Post a new message straight into the chat (no thread), returning its
 /// `message_id` so the caller can subsequently edit it.
 async fn send_feishu_chat_message(
@@ -3027,9 +3049,13 @@ async fn handle_feishu_message(
             // Hard ceiling on continuation messages per turn. Without it a
             // persistently failing edit (e.g. 2200 on every call) would spawn a
             // new message every debounce tick.
-            const MAX_STATUS_MESSAGES: u32 = 6;
+            const MAX_STATUS_MESSAGES: u32 = 20;
             let mut edit_count: u32 = 0;
             let mut status_msgs_created: u32 = 0;
+            // Index into `lines` where the *current* status message starts.
+            // A continuation message shows only lines from here on, instead of
+            // replaying the whole accumulated transcript.
+            let mut window_start: usize = 0;
 
             let debounce = Duration::from_millis(1500);
             let mut last_flush = Instant::now();
@@ -3064,10 +3090,11 @@ async fn handle_feishu_message(
                         dirty = true;
                     }
                     Ok(Some(AgentEvent::Iteration { iteration })) => {
-                        if iteration > 1 {
-                            lines.push(format!("── iteration {} ──", iteration));
-                            dirty = true;
-                        }
+                        // Every iteration gets a label, including the first
+                        // one. Skipping iteration 1 made every status message
+                        // appear to start at 2.
+                        lines.push(format!("── iteration {} ──", iteration));
+                        dirty = true;
                     }
                     Ok(Some(AgentEvent::MidTurnInjection { count })) => {
                         lines.push(crate::channels::event_tap::mid_turn_injection_ack_text(
@@ -3081,7 +3108,7 @@ async fn handle_feishu_message(
                 }
 
                 if dirty && last_flush.elapsed() >= debounce {
-                    let text = format!("⏳ Processing...\n{}", lines.join("\n"));
+                    let text = render_status_body("⏳ Processing...", &lines, window_start);
 
                     if let Some(ref mid) = status_msg_id {
                         // Feishu rejects edits past a per-message limit with
@@ -3132,12 +3159,19 @@ async fn handle_feishu_message(
                                 // the closing summary still reflects reality.
                                 status_msg_id = None;
                             } else {
+                                // Start the continuation window a little before
+                                // the current tail so the reader keeps context,
+                                // but never replay the whole transcript.
+                                const CONTINUATION_TAIL_LINES: usize = 40;
+                                window_start = lines.len().saturating_sub(CONTINUATION_TAIL_LINES);
+                                let cont_text =
+                                    render_status_body("⏳ Processing...", &lines, window_start);
                                 match open_new_status_message(
                                     &progress_http,
                                     &progress_base,
                                     &progress_token,
                                     &status_target,
-                                    &text,
+                                    &cont_text,
                                 )
                                 .await
                                 {
@@ -3145,6 +3179,9 @@ async fn handle_feishu_message(
                                         status_msg_id = Some(mid);
                                         edit_count = 0;
                                         status_msgs_created += 1;
+                                        // The new message already holds the
+                                        // current window; keep later edits fed
+                                        // from the same window start.
                                     }
                                     Err(e) => {
                                         warn!(
@@ -3184,7 +3221,7 @@ async fn handle_feishu_message(
             // The turn's final progress state must always be visible, even if
             // the last status message can no longer be edited or we ran out of
             // message budget.
-            let text = format!("✅ Done\n{}", lines.join("\n"));
+            let text = render_status_body("✅ Done", &lines, window_start);
             let mut done_visible = false;
             if let Some(ref mid) = status_msg_id {
                 if edit_count < MAX_EDITS {
@@ -3921,6 +3958,30 @@ accounts:
     fn random_feishu_ack_reaction_returns_valid_emoji() {
         let emoji = random_feishu_ack_reaction("test message");
         assert!(FEISHU_ACK_REACTIONS.contains(&emoji));
+    }
+
+    #[test]
+    fn render_status_body_marks_continuations_without_replaying_history() {
+        let lines: Vec<String> = (1..=10).map(|i| format!("line {i}")).collect();
+
+        // First window: no continuation banner, everything visible from index 0.
+        let first = render_status_body("⏳ Processing...", &lines, 0);
+        assert!(first.starts_with("⏳ Processing...\nline 1\n"));
+        assert!(!first.contains("见上一条消息"));
+
+        // Continuation: only the tail is rendered, with an explicit pointer to
+        // the earlier message instead of a full replay.
+        let cont = render_status_body("⏳ Processing...", &lines, 7);
+        assert!(cont.starts_with("⏳ Processing...\n（续，前 7 行见上一条消息）\n"));
+        assert!(cont.contains("line 8"));
+        assert!(!cont.contains("line 1\n"));
+        // The iteration labels are inside the rendered lines, so a continuation
+        // must never restart numbering.
+        assert!(cont.contains("line 10"));
+
+        // Defensive: a window start past the end must not panic.
+        let empty = render_status_body("✅ Done", &lines, 99);
+        assert_eq!(empty, "✅ Done\n（续，前 10 行见上一条消息）\n");
     }
 
     /// A CJK code point is 3 bytes, so truncating a Chinese string at a fixed
