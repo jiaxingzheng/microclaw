@@ -1030,18 +1030,25 @@ fn is_feishu_edit_limit(err: &str) -> bool {
 /// live in the previous message. Replaying everything produced N near-identical
 /// copies of the same history and renumbered the turn from scratch each time.
 fn render_status_body(prefix: &str, lines: &[String], window_start: usize) -> String {
-    let start = window_start.min(lines.len());
-    let mut out = String::new();
-    out.push_str(prefix);
-    out.push('\n');
-    if start > 0 {
-        out.push_str(&format!(
-            "（续，前 {} 行见上一条消息）\n",
-            start
-        ));
+    // Feishu rejects oversized text messages, and a status body that grows
+    // unbounded over a long turn eventually hits that wall (surface error:
+    // code=2200). Keep the newest lines and drop the oldest with an explicit
+    // marker.
+    const MAX_BODY_CHARS: usize = 8000;
+    let mut start = window_start.min(lines.len());
+    loop {
+        let mut out = String::new();
+        out.push_str(prefix);
+        out.push('\n');
+        if start > 0 {
+            out.push_str(&format!("（续，前 {} 行见上一条消息）\n", start));
+        }
+        out.push_str(&lines[start..].join("\n"));
+        if out.chars().count() <= MAX_BODY_CHARS || start + 1 >= lines.len() {
+            return out;
+        }
+        start += 1;
     }
-    out.push_str(&lines[start..].join("\n"));
-    out
 }
 
 /// Post a new message straight into the chat (no thread), returning its
@@ -1854,7 +1861,7 @@ fn format_tool_input_summary(name: &str, input: &serde_json::Value) -> String {
     // "byte index N is not a char boundary" whenever a CJK/emoji byte lands on
     // the cut (e.g. a Chinese todo list under 200 chars), which killed the
     // whole tokio worker and surfaced as gateway restarts.
-    const SUMMARY_MAX: usize = 200;
+    const SUMMARY_MAX: usize = 400;
     match name {
         "bash" => {
             let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
@@ -1862,7 +1869,11 @@ fn format_tool_input_summary(name: &str, input: &serde_json::Value) -> String {
                 "bash".into()
             } else if cmd.len() > SUMMARY_MAX {
                 let cut = floor_char_boundary(cmd, SUMMARY_MAX);
-                format!("bash: {}...", &cmd[..cut])
+                format!(
+                    "bash: {}... (+{} chars)",
+                    &cmd[..cut],
+                    cmd.chars().count() - cmd[..cut].chars().count()
+                )
             } else {
                 format!("bash: {}", cmd)
             }
@@ -1908,7 +1919,12 @@ fn format_tool_input_summary(name: &str, input: &serde_json::Value) -> String {
             let compact = serde_json::to_string(input).unwrap_or_default();
             if compact.len() > SUMMARY_MAX {
                 let cut = floor_char_boundary(&compact, SUMMARY_MAX);
-                format!("{}: {}...", name, &compact[..cut])
+                format!(
+                    "{}: {}... (+{} chars)",
+                    name,
+                    &compact[..cut],
+                    compact.chars().count() - compact[..cut].chars().count()
+                )
             } else if compact == "{}" || compact == "null" {
                 name.to_string()
             } else {
@@ -3991,16 +4007,18 @@ accounts:
     fn format_tool_input_summary_handles_multibyte_truncation() {
         let v = |s: &str| serde_json::json!({ "command": s });
 
-        // 600 bytes of CJK: byte index 200 is inside a character.
+        // 600 bytes of CJK: a byte offset inside the budget cuts mid-character.
         let long_cjk = "中文".repeat(100);
         let out = format_tool_input_summary("bash", &v(&long_cjk));
-        assert!(out.ends_with("..."));
+        assert!(out.contains("..."), "expected an elision marker: {out}");
         assert!(out.starts_with("bash: 中文"));
+        assert!(out.contains("(+"), "expected a dropped-char count: {out}");
 
-        // 202 bytes: one byte past an ASCII run, splitting a CJK char.
-        let boundary_probe = format!("{}中", "a".repeat(199));
+        // The cut lands one byte past an ASCII run, splitting a following CJK
+        // char: `SUMMARY_MAX` bytes is inside `中`.
+        let boundary_probe = format!("{}中", "a".repeat(399));
         let out = format_tool_input_summary("bash", &v(&boundary_probe));
-        assert!(out.ends_with("..."));
+        assert!(out.contains("..."), "expected an elision marker: {out}");
 
         // Non-bash tools go through the generic JSON branch; a Chinese todo
         // list under 200 chars but over 200 bytes was the real-world trigger.
