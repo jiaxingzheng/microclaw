@@ -977,6 +977,96 @@ async fn send_feishu_response(
     Ok(())
 }
 
+/// Where a progress/status message should be posted.
+#[derive(Clone)]
+struct StatusTarget {
+    /// Original inbound message id, used when posting inside a thread.
+    reply_to: String,
+    /// Chat id, used when posting directly into the chat.
+    chat_id: String,
+    /// Post into the reply thread instead of the main chat.
+    in_thread: bool,
+}
+
+impl StatusTarget {
+    async fn post(
+        &self,
+        http_client: &reqwest::Client,
+        base_url: &str,
+        token: &str,
+        text: &str,
+    ) -> Result<String, String> {
+        if self.in_thread && !self.reply_to.is_empty() {
+            reply_feishu_thread(http_client, base_url, token, &self.reply_to, text).await
+        } else {
+            send_feishu_chat_message(http_client, base_url, token, &self.chat_id, text).await
+        }
+    }
+}
+
+/// Post a fresh status message for `target` and return its message id.
+async fn open_new_status_message(
+    http_client: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    target: &StatusTarget,
+    text: &str,
+) -> Result<String, String> {
+    target.post(http_client, base_url, token, text).await
+}
+
+/// Feishu reports the per-message edit limit as `code=2200 Internal Error`
+/// rather than a dedicated code. Treat 2200 as "stop editing, start a new
+/// message" so progress never silently stops.
+fn is_feishu_edit_limit(err: &str) -> bool {
+    err.contains("code=2200")
+}
+
+/// Post a new message straight into the chat (no thread), returning its
+/// `message_id` so the caller can subsequently edit it.
+async fn send_feishu_chat_message(
+    http_client: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    chat_id: &str,
+    text: &str,
+) -> Result<String, String> {
+    let content = serde_json::json!({ "text": text }).to_string();
+    let url = format!("{base_url}/open-apis/im/v1/messages?receive_id_type=chat_id");
+    let body = serde_json::json!({
+        "receive_id": chat_id,
+        "msg_type": "text",
+        "content": content,
+    });
+
+    let resp = http_client
+        .post(&url)
+        .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Feishu send_chat_message failed: {e}"))?;
+
+    let resp_json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Feishu send_chat_message parse failed: {e}"))?;
+    let code = resp_json.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+    if code != 0 {
+        let msg = resp_json
+            .get("msg")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        return Err(format!("Feishu send_chat_message error: code={code} msg={msg}"));
+    }
+    resp_json
+        .pointer("/data/message_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| "Feishu send_chat_message: missing data.message_id".to_string())
+}
+
 async fn reply_feishu_thread(
     http_client: &reqwest::Client,
     base_url: &str,
@@ -2906,11 +2996,20 @@ async fn handle_feishu_message(
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
 
-    if topic_mode && show_progress && !message_id.is_empty() {
+    if show_progress && !message_id.is_empty() {
         let progress_http = http_client.clone();
         let progress_base = base_url.to_string();
         let progress_token = token.clone();
         let progress_reply_to = message_id.to_string();
+        let progress_chat_id = external_chat_id.to_string();
+        // Progress reporting is intentionally decoupled from `topic_mode`: the
+        // status message must be visible in the main chat window regardless of
+        // where the final reply lands.
+        let status_target = StatusTarget {
+            reply_to: progress_reply_to.clone(),
+            chat_id: progress_chat_id.clone(),
+            in_thread: topic_mode,
+        };
 
         struct ProgressState {
             used_send_message_tool: bool,
@@ -2925,7 +3024,12 @@ async fn handle_feishu_message(
             let mut used_send_message_tool = false;
             // Feishu: max 20 edits per message; reserve 1 for the final status
             const MAX_EDITS: u32 = 19;
+            // Hard ceiling on continuation messages per turn. Without it a
+            // persistently failing edit (e.g. 2200 on every call) would spawn a
+            // new message every debounce tick.
+            const MAX_STATUS_MESSAGES: u32 = 6;
             let mut edit_count: u32 = 0;
+            let mut status_msgs_created: u32 = 0;
 
             let debounce = Duration::from_millis(1500);
             let mut last_flush = Instant::now();
@@ -2980,8 +3084,15 @@ async fn handle_feishu_message(
                     let text = format!("⏳ Processing...\n{}", lines.join("\n"));
 
                     if let Some(ref mid) = status_msg_id {
+                        // Feishu rejects edits past a per-message limit with
+                        // code=2200 Internal Error, and can also reject them
+                        // for content reasons. Never drop progress silently:
+                        // on any terminal edit failure or once the documented
+                        // edit budget is spent, start a fresh message carrying
+                        // the full accumulated history.
+                        let mut carry_over = false;
                         if edit_count < MAX_EDITS {
-                            if let Err(e) = update_feishu_message(
+                            match update_feishu_message(
                                 &progress_http,
                                 &progress_base,
                                 &progress_token,
@@ -2990,17 +3101,66 @@ async fn handle_feishu_message(
                             )
                             .await
                             {
-                                warn!("Feishu: progress update failed: {e}");
+                                Ok(()) => edit_count += 1,
+                                Err(e) if is_feishu_edit_limit(&e) => {
+                                    info!(
+                                        "Feishu: edit limit reached for status message ({} edits), starting a new one",
+                                        edit_count
+                                    );
+                                    carry_over = true;
+                                }
+                                Err(e) => {
+                                    warn!("Feishu: progress update failed: {e}");
+                                    carry_over = true;
+                                }
+                            }
+                        } else {
+                            info!(
+                                "Feishu: status message exhausted its {} edit budget, continuing in a new message",
+                                MAX_EDITS
+                            );
+                            carry_over = true;
+                        }
+
+                        if carry_over {
+                            if status_msgs_created >= MAX_STATUS_MESSAGES {
+                                warn!(
+                                    "Feishu: status message cap ({}) reached for this turn; progress lines will keep accumulating in memory and are reported in the final summary",
+                                    MAX_STATUS_MESSAGES
+                                );
+                                // Stop trying to edit, but keep collecting so
+                                // the closing summary still reflects reality.
+                                status_msg_id = None;
                             } else {
-                                edit_count += 1;
+                                match open_new_status_message(
+                                    &progress_http,
+                                    &progress_base,
+                                    &progress_token,
+                                    &status_target,
+                                    &text,
+                                )
+                                .await
+                                {
+                                    Ok(mid) => {
+                                        status_msg_id = Some(mid);
+                                        edit_count = 0;
+                                        status_msgs_created += 1;
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "Feishu: failed to start continuation status message: {e}"
+                                        );
+                                        status_msg_id = None;
+                                    }
+                                }
                             }
                         }
                     } else {
-                        match reply_feishu_thread(
+                        match open_new_status_message(
                             &progress_http,
                             &progress_base,
                             &progress_token,
-                            &progress_reply_to,
+                            &status_target,
                             &text,
                         )
                         .await
@@ -3008,6 +3168,7 @@ async fn handle_feishu_message(
                             Ok(mid) => {
                                 status_msg_id = Some(mid);
                                 edit_count = 0;
+                                status_msgs_created += 1;
                             }
                             Err(e) => {
                                 warn!("Feishu: failed to create status message: {e}");
@@ -3020,17 +3181,37 @@ async fn handle_feishu_message(
                 }
             }
 
+            // The turn's final progress state must always be visible, even if
+            // the last status message can no longer be edited or we ran out of
+            // message budget.
+            let text = format!("✅ Done\n{}", lines.join("\n"));
+            let mut done_visible = false;
             if let Some(ref mid) = status_msg_id {
-                let text = format!("✅ Done\n{}", lines.join("\n"));
                 if edit_count < MAX_EDITS {
-                    let _ = update_feishu_message(
+                    done_visible = update_feishu_message(
                         &progress_http,
                         &progress_base,
                         &progress_token,
                         mid,
                         &text,
                     )
-                    .await;
+                    .await
+                    .is_ok();
+                }
+            }
+            if !done_visible && !lines.is_empty() {
+                if let Err(e) = send_feishu_response(
+                    &progress_http,
+                    &progress_base,
+                    &progress_token,
+                    &progress_chat_id,
+                    &text,
+                    &progress_reply_to,
+                    false,
+                )
+                .await
+                {
+                    warn!("Feishu: failed to post final progress summary: {e}");
                 }
             }
 
