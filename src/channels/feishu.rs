@@ -1029,11 +1029,15 @@ fn is_feishu_edit_limit(err: &str) -> bool {
 /// transcript: it shows only its own window and states how many earlier lines
 /// live in the previous message. Replaying everything produced N near-identical
 /// copies of the same history and renumbered the turn from scratch each time.
-fn render_status_body(prefix: &str, lines: &[String], window_start: usize) -> String {
+fn render_status_body(prefix: &str, lines: &[String], window_start: usize) -> (String, usize) {
     // Feishu rejects oversized text messages, and a status body that grows
     // unbounded over a long turn eventually hits that wall (surface error:
     // code=2200). Keep the newest lines and drop the oldest with an explicit
     // marker.
+    //
+    // Returns the body plus the index of the first line it actually shows, so
+    // the caller can tell exactly how much of the transcript is on screen and
+    // start the next message after it (no duplicated lines between messages).
     const MAX_BODY_CHARS: usize = 8000;
     let mut start = window_start.min(lines.len());
     loop {
@@ -1045,7 +1049,7 @@ fn render_status_body(prefix: &str, lines: &[String], window_start: usize) -> St
         }
         out.push_str(&lines[start..].join("\n"));
         if out.chars().count() <= MAX_BODY_CHARS || start + 1 >= lines.len() {
-            return out;
+            return (out, start);
         }
         start += 1;
     }
@@ -3072,6 +3076,10 @@ async fn handle_feishu_message(
             // A continuation message shows only lines from here on, instead of
             // replaying the whole accumulated transcript.
             let mut window_start: usize = 0;
+            // Number of lines the current status message has already shown
+            // (every render goes to the end of `lines`). A continuation starts
+            // exactly here, so no line ever appears in two messages.
+            let mut rendered_end: usize = 0;
 
             let debounce = Duration::from_millis(1500);
             let mut last_flush = Instant::now();
@@ -3124,7 +3132,7 @@ async fn handle_feishu_message(
                 }
 
                 if dirty && last_flush.elapsed() >= debounce {
-                    let text = render_status_body("⏳ Processing...", &lines, window_start);
+                    let (text, _) = render_status_body("⏳ Processing...", &lines, window_start);
 
                     if let Some(ref mid) = status_msg_id {
                         // Feishu rejects edits past a per-message limit with
@@ -3144,7 +3152,10 @@ async fn handle_feishu_message(
                             )
                             .await
                             {
-                                Ok(()) => edit_count += 1,
+                                Ok(()) => {
+                                    edit_count += 1;
+                                    rendered_end = lines.len();
+                                }
                                 Err(e) if is_feishu_edit_limit(&e) => {
                                     info!(
                                         "Feishu: edit limit reached for status message ({} edits), starting a new one",
@@ -3175,13 +3186,14 @@ async fn handle_feishu_message(
                                 // the closing summary still reflects reality.
                                 status_msg_id = None;
                             } else {
-                                // Start the continuation window a little before
-                                // the current tail so the reader keeps context,
-                                // but never replay the whole transcript.
-                                const CONTINUATION_TAIL_LINES: usize = 40;
-                                window_start = lines.len().saturating_sub(CONTINUATION_TAIL_LINES);
-                                let cont_text =
+                                // Continue exactly where the previous message
+                                // stopped. Overlapping a tail window made the
+                                // same iterations show up in two messages, which
+                                // reads like duplicated work.
+                                window_start = rendered_end;
+                                let (cont_text, cont_start) =
                                     render_status_body("⏳ Processing...", &lines, window_start);
+                                window_start = cont_start;
                                 match open_new_status_message(
                                     &progress_http,
                                     &progress_base,
@@ -3198,6 +3210,7 @@ async fn handle_feishu_message(
                                         // The new message already holds the
                                         // current window; keep later edits fed
                                         // from the same window start.
+                                        rendered_end = lines.len();
                                     }
                                     Err(e) => {
                                         warn!(
@@ -3222,6 +3235,7 @@ async fn handle_feishu_message(
                                 status_msg_id = Some(mid);
                                 edit_count = 0;
                                 status_msgs_created += 1;
+                                rendered_end = lines.len();
                             }
                             Err(e) => {
                                 warn!("Feishu: failed to create status message: {e}");
@@ -3237,7 +3251,7 @@ async fn handle_feishu_message(
             // The turn's final progress state must always be visible, even if
             // the last status message can no longer be edited or we ran out of
             // message budget.
-            let text = render_status_body("✅ Done", &lines, window_start);
+            let (text, _) = render_status_body("✅ Done", &lines, window_start);
             let mut done_visible = false;
             if let Some(ref mid) = status_msg_id {
                 if edit_count < MAX_EDITS {
@@ -3981,23 +3995,54 @@ accounts:
         let lines: Vec<String> = (1..=10).map(|i| format!("line {i}")).collect();
 
         // First window: no continuation banner, everything visible from index 0.
-        let first = render_status_body("⏳ Processing...", &lines, 0);
+        let (first, first_start) = render_status_body("⏳ Processing...", &lines, 0);
         assert!(first.starts_with("⏳ Processing...\nline 1\n"));
         assert!(!first.contains("见上一条消息"));
+        assert_eq!(first_start, 0);
 
         // Continuation: only the tail is rendered, with an explicit pointer to
         // the earlier message instead of a full replay.
-        let cont = render_status_body("⏳ Processing...", &lines, 7);
+        let (cont, cont_start) = render_status_body("⏳ Processing...", &lines, 7);
         assert!(cont.starts_with("⏳ Processing...\n（续，前 7 行见上一条消息）\n"));
         assert!(cont.contains("line 8"));
         assert!(!cont.contains("line 1\n"));
         // The iteration labels are inside the rendered lines, so a continuation
         // must never restart numbering.
         assert!(cont.contains("line 10"));
+        assert_eq!(cont_start, 7);
 
         // Defensive: a window start past the end must not panic.
-        let empty = render_status_body("✅ Done", &lines, 99);
+        let (empty, empty_start) = render_status_body("✅ Done", &lines, 99);
         assert_eq!(empty, "✅ Done\n（续，前 10 行见上一条消息）\n");
+        assert_eq!(empty_start, 10);
+    }
+
+    /// Consecutive status messages must not show the same line twice: the
+    /// continuation starts exactly where the previous message stopped.
+    #[test]
+    fn status_messages_do_not_overlap() {
+        // Message 1 was rendered when only 40 lines existed.
+        let first_lines: Vec<String> = (1..=40).map(|i| format!("line {i}")).collect();
+        let (m1, start1) = render_status_body("⏳ Processing...", &first_lines, 0);
+        assert_eq!(start1, 0);
+        assert!(m1.ends_with("line 40"));
+        let rendered_end = first_lines.len();
+
+        // The turn keeps going; the continuation starts at that exact index.
+        let all: Vec<String> = (1..=100).map(|i| format!("line {i}")).collect();
+        let (m2, start2) = render_status_body("⏳ Processing...", &all, rendered_end);
+        assert_eq!(start2, 40);
+        assert!(m2.starts_with("⏳ Processing...\n（续，前 40 行见上一条消息）\nline 41\n"));
+        assert!(!m2.contains("line 40\n"));
+
+        // Every line appears in exactly one message.
+        let mut seen = std::collections::HashSet::new();
+        for m in [&m1, &m2] {
+            for l in m.lines().filter(|l| l.starts_with("line ")) {
+                assert!(seen.insert(l.to_string()), "duplicated across messages: {l}");
+            }
+        }
+        assert_eq!(seen.len(), 100);
     }
 
     /// A CJK code point is 3 bytes, so truncating a Chinese string at a fixed
