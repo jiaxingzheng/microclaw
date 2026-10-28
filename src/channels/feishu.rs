@@ -1022,6 +1022,18 @@ fn is_feishu_edit_limit(err: &str) -> bool {
     err.contains("code=2200")
 }
 
+/// Emit the deferred `── iteration N ──` label, if one is waiting.
+///
+/// The label is held back until the iteration actually invokes a tool: the
+/// final iteration of a turn only writes the answer, so printing its label on
+/// arrival left a dangling header as the last line of the status message and
+/// looked like progress had been truncated.
+fn flush_iteration_label(lines: &mut Vec<String>, pending: &mut Option<usize>) {
+    if let Some(iteration) = pending.take() {
+        lines.push(format!("── iteration {iteration} ──"));
+    }
+}
+
 /// Render the body of a progress/status message.
 ///
 /// `window_start` is the index of the first accumulated line shown in this
@@ -3080,6 +3092,11 @@ async fn handle_feishu_message(
             // (every render goes to the end of `lines`). A continuation starts
             // exactly here, so no line ever appears in two messages.
             let mut rendered_end: usize = 0;
+            // Iteration label waiting for its first tool event. The closing
+            // iteration of a turn calls no tools, so emitting the label as soon
+            // as the iteration starts left a dangling "── iteration N ──" with
+            // nothing under it, which read as if progress had been cut off.
+            let mut pending_iteration: Option<usize> = None;
 
             let debounce = Duration::from_millis(1500);
             let mut last_flush = Instant::now();
@@ -3089,6 +3106,7 @@ async fn handle_feishu_message(
 
                 match event {
                     Ok(Some(AgentEvent::ToolStart { name, input, .. })) => {
+                        flush_iteration_label(&mut lines, &mut pending_iteration);
                         let summary = format_tool_input_summary(&name, &input);
                         lines.push(format!("▶ Executing tool: {}", summary));
                         dirty = true;
@@ -3100,6 +3118,9 @@ async fn handle_feishu_message(
                         duration_ms,
                         ..
                     })) => {
+                        // A tool can fail before ToolStart is emitted, so make
+                        // sure its iteration label still reaches the transcript.
+                        flush_iteration_label(&mut lines, &mut pending_iteration);
                         if name == "send_message" && !is_error {
                             used_send_message_tool = true;
                         }
@@ -3116,11 +3137,14 @@ async fn handle_feishu_message(
                     Ok(Some(AgentEvent::Iteration { iteration })) => {
                         // Every iteration gets a label, including the first
                         // one. Skipping iteration 1 made every status message
-                        // appear to start at 2.
-                        lines.push(format!("── iteration {} ──", iteration));
-                        dirty = true;
+                        // appear to start at 2. The label is deferred until the
+                        // iteration actually starts a tool: a final iteration
+                        // that only writes the answer would otherwise leave the
+                        // label as the last line of the transcript.
+                        pending_iteration = Some(iteration);
                     }
                     Ok(Some(AgentEvent::MidTurnInjection { count })) => {
+                        flush_iteration_label(&mut lines, &mut pending_iteration);
                         lines.push(crate::channels::event_tap::mid_turn_injection_ack_text(
                             count,
                         ));
@@ -3988,6 +4012,36 @@ accounts:
     fn random_feishu_ack_reaction_returns_valid_emoji() {
         let emoji = random_feishu_ack_reaction("test message");
         assert!(FEISHU_ACK_REACTIONS.contains(&emoji));
+    }
+
+    /// A turn whose last iteration only writes the answer must not end on a
+    /// bare `── iteration N ──` header: that reads like the progress report was
+    /// truncated. The label is deferred until the iteration runs a tool.
+    #[test]
+    fn iteration_label_is_deferred_until_a_tool_runs() {
+        let mut lines: Vec<String> = Vec::new();
+        let mut pending: Option<usize> = None;
+
+        // Iteration 1 runs a tool: the label appears before the tool line.
+        pending = Some(1);
+        assert!(lines.is_empty(), "label must not print on arrival");
+        flush_iteration_label(&mut lines, &mut pending);
+        lines.push("✓ bash (5ms)".to_string());
+        assert_eq!(lines, ["── iteration 1 ──", "✓ bash (5ms)"]);
+
+        // Final iteration: no tool, so no trailing header is left behind.
+        pending = Some(2);
+        assert!(pending.is_some());
+        let body = render_status_body("✅ Done", &lines, 0).0;
+        assert!(!body.contains("── iteration 2 ──"));
+        assert!(body.ends_with("✓ bash (5ms)"));
+
+        // A tool that reports a result without a start still gets its label.
+        flush_iteration_label(&mut lines, &mut pending);
+        lines.push("✗ bash (3ms): boom".to_string());
+        assert_eq!(lines.last().map(String::as_str), Some("✗ bash (3ms): boom"));
+        assert_eq!(lines[2], "── iteration 2 ──");
+        assert!(pending.is_none());
     }
 
     #[test]
