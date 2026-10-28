@@ -1,0 +1,63 @@
+name: Build patched Linux binary
+
+# Ad-hoc workflow: builds the x86_64-linux binary from this branch so a
+# self-hosted deployment can pick up the UTF-8 truncation fix without a
+# full release. Mirrors the `default` flavor of release-assets.yml.
+
+on:
+  push:
+    branches:
+      - fix/feishu-progress-visible
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: linux-x86_64-default
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build embedded web assets
+        run: |
+          npm --prefix web ci
+          npm --prefix web run build
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore Rust release cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: patched-linux-x86_64-default
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Verify binary
+        run: |
+          target/release/microclaw --version
+          stat -c '%s bytes' target/release/microclaw
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: microclaw-x86_64-linux-gnu-patched
+          path: target/release/microclaw
+          if-no-files-found: error
+          retention-days: 14
