@@ -20,6 +20,7 @@ use crate::chat_commands::{handle_chat_command, is_slash_command, unknown_comman
 use crate::chat_turn_queue::PendingMessage;
 use crate::runtime::AppState;
 use crate::setup_def::{ChannelFieldDef, DynamicChannelDef};
+use microclaw_core::text::floor_char_boundary;
 use microclaw_engine::channel::ConversationKind;
 use microclaw_engine::channel_adapter::ChannelAdapter;
 use microclaw_engine::storage::db::call_blocking;
@@ -1737,13 +1738,19 @@ async fn update_feishu_message(
 }
 
 fn format_tool_input_summary(name: &str, input: &serde_json::Value) -> String {
+    // Truncate on a UTF-8 char boundary. Byte-slicing here panics with
+    // "byte index N is not a char boundary" whenever a CJK/emoji byte lands on
+    // the cut (e.g. a Chinese todo list under 200 chars), which killed the
+    // whole tokio worker and surfaced as gateway restarts.
+    const SUMMARY_MAX: usize = 200;
     match name {
         "bash" => {
             let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
             if cmd.is_empty() {
                 "bash".into()
-            } else if cmd.len() > 200 {
-                format!("bash: {}...", &cmd[..200])
+            } else if cmd.len() > SUMMARY_MAX {
+                let cut = floor_char_boundary(cmd, SUMMARY_MAX);
+                format!("bash: {}...", &cmd[..cut])
             } else {
                 format!("bash: {}", cmd)
             }
@@ -1787,8 +1794,9 @@ fn format_tool_input_summary(name: &str, input: &serde_json::Value) -> String {
         }
         _ => {
             let compact = serde_json::to_string(input).unwrap_or_default();
-            if compact.len() > 200 {
-                format!("{}: {}...", name, &compact[..200])
+            if compact.len() > SUMMARY_MAX {
+                let cut = floor_char_boundary(&compact, SUMMARY_MAX);
+                format!("{}: {}...", name, &compact[..cut])
             } else if compact == "{}" || compact == "null" {
                 name.to_string()
             } else {
@@ -3732,5 +3740,40 @@ accounts:
     fn random_feishu_ack_reaction_returns_valid_emoji() {
         let emoji = random_feishu_ack_reaction("test message");
         assert!(FEISHU_ACK_REACTIONS.contains(&emoji));
+    }
+
+    /// A CJK code point is 3 bytes, so truncating a Chinese string at a fixed
+    /// *byte* offset lands mid-character and panics. These cases all panicked
+    /// before the switch to `floor_char_boundary`.
+    #[test]
+    fn format_tool_input_summary_handles_multibyte_truncation() {
+        let v = |s: &str| serde_json::json!({ "command": s });
+
+        // 600 bytes of CJK: byte index 200 is inside a character.
+        let long_cjk = "中文".repeat(100);
+        let out = format_tool_input_summary("bash", &v(&long_cjk));
+        assert!(out.ends_with("..."));
+        assert!(out.starts_with("bash: 中文"));
+
+        // 202 bytes: one byte past an ASCII run, splitting a CJK char.
+        let boundary_probe = format!("{}中", "a".repeat(199));
+        let out = format_tool_input_summary("bash", &v(&boundary_probe));
+        assert!(out.ends_with("..."));
+
+        // Non-bash tools go through the generic JSON branch; a Chinese todo
+        // list under 200 chars but over 200 bytes was the real-world trigger.
+        let todos = serde_json::json!({
+            "chat_id": 2,
+            "todos": [
+                { "status": "in_progress", "task": "定位 microclaw 源码与字节截断点" },
+                { "status": "pending", "task": "改为 UTF-8 字符边界安全截断" },
+            ],
+        });
+        let out = format_tool_input_summary("todo_write", &todos);
+        assert!(!out.is_empty());
+        assert!(out.chars().count() > 0);
+
+        // Short inputs pass through unchanged.
+        assert_eq!(format_tool_input_summary("bash", &v("ls")), "bash: ls");
     }
 }

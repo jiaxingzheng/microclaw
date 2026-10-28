@@ -2022,7 +2022,10 @@ async fn send_streaming_response(
 
                     // Truncate if too long for Telegram (4096 limit)
                     let edit_text = if display_text.len() > 4000 {
-                        format!("{}...(truncated)", &display_text[..4000])
+                        // UTF-8 safe: a CJK byte at index 4000 would otherwise
+                        // panic the tokio worker.
+                        let cut = floor_char_boundary(&display_text, 4000);
+                        format!("{}...(truncated)", &display_text[..cut])
                     } else {
                         display_text
                     };
