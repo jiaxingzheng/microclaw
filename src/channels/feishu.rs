@@ -4020,10 +4020,9 @@ accounts:
     #[test]
     fn iteration_label_is_deferred_until_a_tool_runs() {
         let mut lines: Vec<String> = Vec::new();
-        let mut pending: Option<usize> = None;
+        let mut pending: Option<usize> = Some(1);
 
         // Iteration 1 runs a tool: the label appears before the tool line.
-        pending = Some(1);
         assert!(lines.is_empty(), "label must not print on arrival");
         flush_iteration_label(&mut lines, &mut pending);
         lines.push("✓ bash (5ms)".to_string());
