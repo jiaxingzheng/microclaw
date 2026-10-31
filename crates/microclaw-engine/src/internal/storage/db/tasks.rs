@@ -364,11 +364,25 @@ impl Database {
         let conn = self.lock_conn();
         match next_run {
             Some(next) => {
-                // Recurring task: reschedule and stay active regardless of this
-                // run's outcome (a transient failure retries on the next tick).
+                // Recurring task: reschedule, but only if the task is still
+                // meant to run. A run takes minutes; during that window the
+                // operator may have cancelled (or paused) the task. Writing an
+                // unconditional `status = 'active'` here would silently undo
+                // that intent and the task would fire again on the next tick
+                // (observed in production: eight consecutive runs, each one
+                // cancelled by the agent itself, each one resurrected).
+                //
+                // `cancelled` therefore wins over the reschedule, while
+                // `running` (the normal case) and any other in-flight status
+                // still become `active`. `next_run`/`last_run`/`run_count` are
+                // still updated so the history stays truthful and a later
+                // explicit `resume` has a sane next firing time.
                 conn.execute(
                     "UPDATE scheduled_tasks
-                     SET last_run = ?1, next_run = ?2, status = 'active',
+                     SET last_run = ?1, next_run = ?2,
+                         status = CASE WHEN status = 'cancelled' THEN 'cancelled'
+                                       WHEN status = 'paused' THEN 'paused'
+                                       ELSE 'active' END,
                          run_count = run_count + 1
                      WHERE id = ?3",
                     params![last_run, next, task_id],
@@ -379,6 +393,8 @@ impl Database {
                 // becomes 'failed' (and is recorded in the DLQ) rather than
                 // masquerading as 'completed'. A lifecycle retirement is always
                 // 'completed' — the task did all the running it was asked to.
+                // A cancel that landed mid-run is also terminal, so it is
+                // preserved instead of being overwritten with 'completed'.
                 let status = if lifecycle_finished || success {
                     "completed"
                 } else {
@@ -386,7 +402,10 @@ impl Database {
                 };
                 conn.execute(
                     "UPDATE scheduled_tasks
-                     SET last_run = ?1, status = ?2, run_count = run_count + 1
+                     SET last_run = ?1,
+                         status = CASE WHEN status = 'cancelled' THEN 'cancelled'
+                                       ELSE ?2 END,
+                         run_count = run_count + 1
                      WHERE id = ?3",
                     params![last_run, status, task_id],
                 )?;
@@ -806,6 +825,106 @@ mod tests {
 
         // Non-existent task
         assert!(!db.update_task_status(9999, "paused").unwrap());
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_cancel_during_run_survives_writeback() {
+        let (db, dir) = test_db();
+        let id = db
+            .create_scheduled_task(100, "recurring", "cron", "0 * * * * *", "2024-01-01T00:00:00Z")
+            .unwrap();
+
+        // The scheduler claimed the task: status = 'running'.
+        db.update_task_status(id, "running").unwrap();
+        // The operator cancels it while the run is still in flight.
+        db.update_task_status(id, "cancelled").unwrap();
+
+        // The run finishes and writes back its result. This must not flip the
+        // task back to 'active', otherwise it fires again forever.
+        db.update_task_after_run_lifecycle(
+            id,
+            "2024-01-01T00:01:00Z",
+            Some("2024-01-01T00:02:00Z"),
+            true,
+            false,
+        )
+        .unwrap();
+
+        let task = db.get_task_by_id(id).unwrap().unwrap();
+        assert_eq!(task.status, "cancelled", "cancel must survive writeback");
+        assert_eq!(task.next_run, "2024-01-01T00:02:00Z");
+        assert_eq!(task.run_count, 1);
+
+        // The list of runnable tasks must stay empty.
+        assert!(db.get_tasks_for_chat(100).unwrap().is_empty());
+
+        // An explicit resume still works.
+        assert!(db.update_task_status(id, "active").unwrap());
+        assert_eq!(db.get_tasks_for_chat(100).unwrap().len(), 1);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_pause_during_run_survives_writeback() {
+        let (db, dir) = test_db();
+        let id = db
+            .create_scheduled_task(100, "recurring", "cron", "0 * * * * *", "2024-01-01T00:00:00Z")
+            .unwrap();
+
+        db.update_task_status(id, "running").unwrap();
+        db.update_task_status(id, "paused").unwrap();
+        db.update_task_after_run_lifecycle(
+            id,
+            "2024-01-01T00:01:00Z",
+            Some("2024-01-01T00:02:00Z"),
+            true,
+            false,
+        )
+        .unwrap();
+
+        let task = db.get_task_by_id(id).unwrap().unwrap();
+        assert_eq!(task.status, "paused");
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_normal_run_still_reactivates() {
+        let (db, dir) = test_db();
+        let id = db
+            .create_scheduled_task(100, "recurring", "cron", "0 * * * * *", "2024-01-01T00:00:00Z")
+            .unwrap();
+
+        db.update_task_status(id, "running").unwrap();
+        db.update_task_after_run_lifecycle(
+            id,
+            "2024-01-01T00:01:00Z",
+            Some("2024-01-01T00:02:00Z"),
+            true,
+            false,
+        )
+        .unwrap();
+
+        let task = db.get_task_by_id(id).unwrap().unwrap();
+        assert_eq!(task.status, "active");
+        assert_eq!(task.run_count, 1);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_cancel_during_run_survives_one_shot_writeback() {
+        let (db, dir) = test_db();
+        let id = db
+            .create_scheduled_task(100, "once", "once", "2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z")
+            .unwrap();
+
+        db.update_task_status(id, "running").unwrap();
+        db.update_task_status(id, "cancelled").unwrap();
+        db.update_task_after_run_lifecycle(id, "2024-01-01T00:01:00Z", None, true, false)
+            .unwrap();
+
+        let task = db.get_task_by_id(id).unwrap().unwrap();
+        assert_eq!(task.status, "cancelled");
         cleanup(&dir);
     }
 
