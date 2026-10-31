@@ -8,6 +8,7 @@ on:
   push:
     branches:
       - fix/feishu-progress-visible
+      - fix/cancel-during-run
   workflow_dispatch:
 
 permissions:
