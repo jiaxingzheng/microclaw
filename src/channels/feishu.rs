@@ -2201,6 +2201,34 @@ fn extract_service_id(url: &str) -> i32 {
 // Ensure token helper for standalone functions
 // ---------------------------------------------------------------------------
 
+/// Feishu tenant_access_token 有效期 7200s, 服务端在 `get_token` 里提前 300s
+/// 刷新 => 单份 token 实际可用约 115 分钟。
+///
+/// 但一次 agent turn (尤其回测) 可以跑几小时, 而进度任务与最终答案投递都只是
+/// 在任务**开始时**克隆一份 token 快照。快照过期后:
+///   - 进度编辑全部失败 -> 用户看到「卡住不动」
+///   - 最终答案投递失败 -> 用户**根本收不到结果**
+/// 这里用一个略保守的 TTL 作为主动刷新阈值。
+const PROGRESS_TOKEN_TTL: Duration = Duration::from_secs(6000);
+
+/// Refresh the token used by long-lived delivery paths (progress task, final
+/// answer). Returns `None` on failure so callers keep the old token and let the
+/// existing error paths log — a refresh failure must never abort the turn.
+async fn refresh_progress_token(
+    http_client: &reqwest::Client,
+    base_url: &str,
+    app_id: &str,
+    app_secret: &str,
+) -> Option<String> {
+    match get_token(http_client, base_url, app_id, app_secret).await {
+        Ok(t) => Some(t),
+        Err(e) => {
+            warn!("Feishu: progress token refresh failed: {e}");
+            None
+        }
+    }
+}
+
 async fn get_token(
     http_client: &reqwest::Client,
     base_url: &str,
@@ -2723,7 +2751,7 @@ async fn handle_feishu_message(
     }
 
     // Handle slash commands
-    let token = match get_token(
+    let mut token = match get_token(
         &http_client,
         base_url,
         &feishu_cfg.app_id,
@@ -2737,6 +2765,10 @@ async fn handle_feishu_message(
             return;
         }
     };
+    // 这个 token 会被进度任务和**最终答案投递**共用, 而一次 turn 可能远超
+    // token 生命周期 (见 PROGRESS_TOKEN_TTL)。投递前必须按 elapsed 刷新,
+    // 否则长任务的结果永远发不出去。
+    let token_at = Instant::now();
 
     let mut text = text.to_string();
     let mut image_data: Option<(String, String)> = None;
@@ -3053,7 +3085,12 @@ async fn handle_feishu_message(
     if show_progress && !message_id.is_empty() {
         let progress_http = http_client.clone();
         let progress_base = base_url.to_string();
-        let progress_token = token.clone();
+        let mut progress_token = token.clone();
+        let mut progress_token_at = Instant::now();
+        // 进度任务会活过单个 token 窗口, 必须持有凭证以便周期刷新,
+        // 不能只依赖启动时克隆的那份快照。
+        let progress_app_id = feishu_cfg.app_id.clone();
+        let progress_app_secret = feishu_cfg.app_secret.clone();
         let progress_reply_to = message_id.to_string();
         let progress_chat_id = external_chat_id.to_string();
         // Progress reporting is intentionally decoupled from `topic_mode`: the
@@ -3165,17 +3202,55 @@ async fn handle_feishu_message(
                         // on any terminal edit failure or once the documented
                         // edit budget is spent, start a fresh message carrying
                         // the full accumulated history.
+                        // token 可能已过期: 过期会被当成普通失败而触发
+                        // carry_over, 于是不停开新消息却一条也发不出去。
+                        if progress_token_at.elapsed() >= PROGRESS_TOKEN_TTL {
+                            if let Some(t) = refresh_progress_token(
+                                &progress_http,
+                                &progress_base,
+                                &progress_app_id,
+                                &progress_app_secret,
+                            )
+                            .await
+                            {
+                                progress_token = t;
+                                progress_token_at = Instant::now();
+                            }
+                        }
+
                         let mut carry_over = false;
                         if edit_count < MAX_EDITS {
-                            match update_feishu_message(
+                            let mut res = update_feishu_message(
                                 &progress_http,
                                 &progress_base,
                                 &progress_token,
                                 mid,
                                 &text,
                             )
-                            .await
-                            {
+                            .await;
+                            // token 也可能被提前吊销 (密钥轮换等): 失败即刷新重试一次
+                            if res.is_err() {
+                                if let Some(t) = refresh_progress_token(
+                                    &progress_http,
+                                    &progress_base,
+                                    &progress_app_id,
+                                    &progress_app_secret,
+                                )
+                                .await
+                                {
+                                    progress_token = t;
+                                    progress_token_at = Instant::now();
+                                    res = update_feishu_message(
+                                        &progress_http,
+                                        &progress_base,
+                                        &progress_token,
+                                        mid,
+                                        &text,
+                                    )
+                                    .await;
+                                }
+                            }
+                            match res {
                                 Ok(()) => {
                                     edit_count += 1;
                                     rendered_end = lines.len();
@@ -3276,19 +3351,53 @@ async fn handle_feishu_message(
             // the last status message can no longer be edited or we ran out of
             // message budget.
             let (text, _) = render_status_body("✅ Done", &lines, window_start);
+            // 收尾是用户唯一确认「跑完了」的信号, 长任务下 token 大概率已过期:
+            // 这里无条件先刷新 (失败则沿用旧 token), 再走编辑/新消息兜底。
+            if progress_token_at.elapsed() >= PROGRESS_TOKEN_TTL {
+                if let Some(t) = refresh_progress_token(
+                    &progress_http,
+                    &progress_base,
+                    &progress_app_id,
+                    &progress_app_secret,
+                )
+                .await
+                {
+                    progress_token = t;
+                    progress_token_at = Instant::now();
+                }
+            }
             let mut done_visible = false;
             if let Some(ref mid) = status_msg_id {
-                if edit_count < MAX_EDITS {
-                    done_visible = update_feishu_message(
+                // 收尾不受 MAX_EDITS 约束: 额度耗尽时仍要能把「已完成」发出来。
+                let mut res = update_feishu_message(
+                    &progress_http,
+                    &progress_base,
+                    &progress_token,
+                    mid,
+                    &text,
+                )
+                .await;
+                if res.is_err() {
+                    if let Some(t) = refresh_progress_token(
                         &progress_http,
                         &progress_base,
-                        &progress_token,
-                        mid,
-                        &text,
+                        &progress_app_id,
+                        &progress_app_secret,
                     )
                     .await
-                    .is_ok();
+                    {
+                        progress_token = t;
+                        res = update_feishu_message(
+                            &progress_http,
+                            &progress_base,
+                            &progress_token,
+                            mid,
+                            &text,
+                        )
+                        .await;
+                    }
                 }
+                done_visible = res.is_ok();
             }
             if !done_visible && !lines.is_empty() {
                 if let Err(e) = send_feishu_response(
@@ -3326,6 +3435,20 @@ async fn handle_feishu_message(
         .await
         {
             Ok(response) => {
+                // 长任务 (>PROGRESS_TOKEN_TTL) 下 token 必然过期: 最终答案/错误
+                // 消息是本 turn 唯一的对外产出, 投递前必须刷新。
+                if token_at.elapsed() >= PROGRESS_TOKEN_TTL {
+                    if let Some(t) = refresh_progress_token(
+                        &http_client,
+                        base_url,
+                        &feishu_cfg.app_id,
+                        &feishu_cfg.app_secret,
+                    )
+                    .await
+                    {
+                        token = t;
+                    }
+                }
                 drop(event_tx);
                 let _ = progress_handle.await;
                 let used_send_message_tool = progress_done_rx
@@ -3486,6 +3609,20 @@ async fn handle_feishu_message(
                 }
             }
             Err(e) => {
+                // 长任务 (>PROGRESS_TOKEN_TTL) 下 token 必然过期: 最终答案/错误
+                // 消息是本 turn 唯一的对外产出, 投递前必须刷新。
+                if token_at.elapsed() >= PROGRESS_TOKEN_TTL {
+                    if let Some(t) = refresh_progress_token(
+                        &http_client,
+                        base_url,
+                        &feishu_cfg.app_id,
+                        &feishu_cfg.app_secret,
+                    )
+                    .await
+                    {
+                        token = t;
+                    }
+                }
                 drop(event_tx);
                 let _ = progress_handle.await;
                 error!("Error processing Feishu message: {e}");
@@ -3557,6 +3694,20 @@ async fn handle_feishu_message(
         .await
         {
             Ok(response) => {
+                // 长任务 (>PROGRESS_TOKEN_TTL) 下 token 必然过期: 最终答案/错误
+                // 消息是本 turn 唯一的对外产出, 投递前必须刷新。
+                if token_at.elapsed() >= PROGRESS_TOKEN_TTL {
+                    if let Some(t) = refresh_progress_token(
+                        &http_client,
+                        base_url,
+                        &feishu_cfg.app_id,
+                        &feishu_cfg.app_secret,
+                    )
+                    .await
+                    {
+                        token = t;
+                    }
+                }
                 drop(event_tx);
                 let mut used_send_message_tool = false;
                 while let Some(event) = tap.replay_rx.recv().await {
@@ -3721,6 +3872,20 @@ async fn handle_feishu_message(
                 }
             }
             Err(e) => {
+                // 长任务 (>PROGRESS_TOKEN_TTL) 下 token 必然过期: 最终答案/错误
+                // 消息是本 turn 唯一的对外产出, 投递前必须刷新。
+                if token_at.elapsed() >= PROGRESS_TOKEN_TTL {
+                    if let Some(t) = refresh_progress_token(
+                        &http_client,
+                        base_url,
+                        &feishu_cfg.app_id,
+                        &feishu_cfg.app_secret,
+                    )
+                    .await
+                    {
+                        token = t;
+                    }
+                }
                 error!("Error processing Feishu message: {e}");
                 if !should_suppress_user_error(&e) {
                     let _ = send_feishu_response(

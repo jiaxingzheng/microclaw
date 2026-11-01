@@ -750,7 +750,13 @@ pub async fn collect_plugin_context_injections(
                         continue;
                     }
                     if content.len() > provider.max_chars {
-                        content.truncate(provider.max_chars);
+                        // 插件 stdout 是任意 UTF-8: 直接按字节 truncate 会切在
+                        // 多字节字符中间并 panic (中文插件输出必崩)。
+                        let cutoff = microclaw_core::text::floor_char_boundary(
+                            &content,
+                            provider.max_chars,
+                        );
+                        content.truncate(cutoff);
                     }
                     out.push(PluginContextInjection {
                         plugin_name: manifest.name.clone(),
