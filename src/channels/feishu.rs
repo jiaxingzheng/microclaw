@@ -2208,6 +2208,7 @@ fn extract_service_id(url: &str) -> i32 {
 /// 在任务**开始时**克隆一份 token 快照。快照过期后:
 ///   - 进度编辑全部失败 -> 用户看到「卡住不动」
 ///   - 最终答案投递失败 -> 用户**根本收不到结果**
+///
 /// 这里用一个略保守的 TTL 作为主动刷新阈值。
 const PROGRESS_TOKEN_TTL: Duration = Duration::from_secs(6000);
 
@@ -3363,7 +3364,6 @@ async fn handle_feishu_message(
                 .await
                 {
                     progress_token = t;
-                    progress_token_at = Instant::now();
                 }
             }
             let mut done_visible = false;
