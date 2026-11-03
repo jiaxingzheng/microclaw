@@ -132,6 +132,14 @@ pub struct FeishuAccountConfig {
     pub topic_mode: bool,
     #[serde(default)]
     pub show_progress: bool,
+    #[serde(default)]
+    pub ack_reaction: Option<bool>,
+    #[serde(default)]
+    pub receive_reaction: Option<String>,
+    #[serde(default)]
+    pub working_reaction: Option<String>,
+    #[serde(default)]
+    pub done_reaction: Option<String>,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
 }
@@ -168,8 +176,18 @@ pub struct FeishuChannelConfig {
     pub accounts: HashMap<String, FeishuAccountConfig>,
     #[serde(default)]
     pub default_account: Option<String>,
+    /// 收到消息即加一个表情 (默认 OK), 干完活再换成 done_reaction。
     #[serde(default)]
     pub ack_reaction: bool,
+    /// 收到消息时加的表情, 默认 `OK`。
+    #[serde(default)]
+    pub receive_reaction: Option<String>,
+    /// 开始干活时加的表情, 默认 `Typing`。
+    #[serde(default)]
+    pub working_reaction: Option<String>,
+    /// 干完活时加的表情, 默认 `DONE`。
+    #[serde(default)]
+    pub done_reaction: Option<String>,
 }
 
 fn pick_default_account_id(
@@ -235,7 +253,19 @@ pub fn build_feishu_runtime_contexts(config: &crate::config::Config) -> Vec<Feis
             show_progress: account_cfg.show_progress,
             accounts: HashMap::new(),
             default_account: None,
-            ack_reaction: feishu_cfg.ack_reaction,
+            ack_reaction: account_cfg.ack_reaction.unwrap_or(feishu_cfg.ack_reaction),
+            receive_reaction: account_cfg
+                .receive_reaction
+                .clone()
+                .or_else(|| feishu_cfg.receive_reaction.clone()),
+            working_reaction: account_cfg
+                .working_reaction
+                .clone()
+                .or_else(|| feishu_cfg.working_reaction.clone()),
+            done_reaction: account_cfg
+                .done_reaction
+                .clone()
+                .or_else(|| feishu_cfg.done_reaction.clone()),
         };
         let bot_username = if account_cfg.bot_username.trim().is_empty() {
             config.bot_username_for_channel(&channel_name)
@@ -1462,21 +1492,6 @@ pub(crate) fn system_prompt_extension(caller_channel: &str) -> Option<&'static s
 // ACK Reaction (已读标记)
 // ---------------------------------------------------------------------------
 
-const FEISHU_ACK_REACTIONS: &[&str] = &["OK", "THUMBSUP", "DONE", "SMILE", "APPLAUSE", "MUSCLE"];
-
-fn pick_uniform_index(len: usize, seed: &str) -> usize {
-    debug_assert!(len > 0);
-    // Simple hash-based selection using message text as seed
-    let hash: u64 = seed
-        .bytes()
-        .fold(0u64, |acc, b| acc.wrapping_mul(33).wrapping_add(b as u64));
-    (hash as usize) % len
-}
-
-fn random_feishu_ack_reaction(text: &str) -> &'static str {
-    FEISHU_ACK_REACTIONS[pick_uniform_index(FEISHU_ACK_REACTIONS.len(), text)]
-}
-
 fn normalize_reaction_alias(input: &str) -> String {
     input
         .chars()
@@ -1731,7 +1746,7 @@ async fn send_feishu_reaction(
     token: &str,
     message_id: &str,
     emoji_type: &str,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let url = format!("{base_url}/open-apis/im/v1/messages/{message_id}/reactions");
     let body = serde_json::json!({
         "reaction_type": {
@@ -1759,6 +1774,171 @@ async fn send_feishu_reaction(
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
         return Err(format!("Feishu send_reaction error: code={code} msg={msg}"));
+    }
+    // reaction_id 用于后续删除/替换(例如 "干活中" -> "完成")。
+    Ok(resp_json
+        .get("data")
+        .and_then(|d| d.get("reaction_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string())
+}
+
+// ---------------------------------------------------------------------------
+// 三段式状态表情: 收到 -> 干活中 -> 完成
+// ---------------------------------------------------------------------------
+
+const FEISHU_DEFAULT_RECEIVE_REACTION: &str = "OK";
+const FEISHU_DEFAULT_WORKING_REACTION: &str = "Typing";
+const FEISHU_DEFAULT_DONE_REACTION: &str = "DONE";
+
+/// 加一个表情并返回 reaction_id。失败只 WARN, 绝不影响主流程。
+async fn feishu_add_reaction(
+    http_client: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    message_id: &str,
+    emoji: &str,
+) -> Option<String> {
+    if message_id.trim().is_empty() || emoji.trim().is_empty() {
+        return None;
+    }
+    match send_feishu_reaction(http_client, base_url, token, message_id, emoji).await {
+        Ok(id) => Some(id),
+        Err(e) => {
+            // 部分租户会拒掉某些表情类型(231001): 退化成 OK 保证仍有反馈。
+            if e.contains("code=231001") && !emoji.eq_ignore_ascii_case("OK") {
+                if let Ok(id) =
+                    send_feishu_reaction(http_client, base_url, token, message_id, "OK").await
+                {
+                    warn!("Feishu: reaction '{emoji}' unsupported, downgraded to OK");
+                    return Some(id);
+                }
+            }
+            warn!("Feishu: add reaction '{emoji}' failed: {e}");
+            None
+        }
+    }
+}
+
+/// 把状态表情从 `current` 换成 `emoji`。Feishu 没有 edit reaction API,
+/// 只能 delete 旧的 + add 新的。
+async fn feishu_swap_reaction(
+    http_client: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    message_id: &str,
+    current: &Mutex<Option<String>>,
+    emoji: &str,
+) {
+    if message_id.trim().is_empty() || emoji.trim().is_empty() {
+        return;
+    }
+    let previous = current.lock().ok().and_then(|mut g| g.take());
+    if let Some(prev_id) = previous.as_deref() {
+        if let Err(e) =
+            delete_feishu_reaction(http_client, base_url, token, message_id, prev_id).await
+        {
+            warn!("Feishu: delete previous reaction failed: {e}");
+        }
+    }
+    match send_feishu_reaction(http_client, base_url, token, message_id, emoji).await {
+        Ok(id) => {
+            if let Ok(mut g) = current.lock() {
+                *g = Some(id);
+            }
+        }
+        Err(e) => warn!("Feishu: swap reaction to '{emoji}' failed: {e}"),
+    }
+}
+
+/// turn 结束时把状态表情换成「完成」。用 Drop 保证**所有**退出路径(提前
+/// return / 错误分支 / panic 展开)都收尾, 不给用户留一个永远转的"干活中"。
+struct FeishuReactionGuard {
+    http_client: reqwest::Client,
+    base_url: String,
+    app_id: String,
+    app_secret: String,
+    token: String,
+    token_at: Instant,
+    message_id: String,
+    current: Arc<Mutex<Option<String>>>,
+    done_emoji: String,
+}
+
+impl Drop for FeishuReactionGuard {
+    fn drop(&mut self) {
+        let Some(prev_id) = self.current.lock().ok().and_then(|mut g| g.take()) else {
+            return;
+        };
+        let http = self.http_client.clone();
+        let base = self.base_url.clone();
+        let app_id = self.app_id.clone();
+        let app_secret = self.app_secret.clone();
+        let message_id = self.message_id.clone();
+        let done = self.done_emoji.clone();
+        let mut token = self.token.clone();
+        let stale = self.token_at.elapsed() >= PROGRESS_TOKEN_TTL;
+        // Drop 里不能 await: 交给后台任务收尾。
+        let spawned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tokio::spawn(async move {
+                if stale {
+                    match get_token(&http, &base, &app_id, &app_secret).await {
+                        Ok(t) => token = t,
+                        Err(e) => warn!("Feishu: final reaction token refresh failed: {e}"),
+                    }
+                }
+                if let Err(e) =
+                    delete_feishu_reaction(&http, &base, &token, &message_id, &prev_id).await
+                {
+                    warn!("Feishu: final reaction delete failed: {e}");
+                    return;
+                }
+                if let Err(e) = send_feishu_reaction(&http, &base, &token, &message_id, &done).await
+                {
+                    warn!("Feishu: final reaction add '{done}' failed: {e}");
+                }
+            })
+        }));
+        if spawned.is_err() {
+            warn!("Feishu: no tokio runtime available for final reaction swap");
+        }
+    }
+}
+
+/// 删除自己加过的 reaction。表情是「替换」而非「修改」的, Feishu 没有 edit API,
+/// 只能 delete 旧的 + add 新的。
+async fn delete_feishu_reaction(
+    http_client: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    message_id: &str,
+    reaction_id: &str,
+) -> Result<(), String> {
+    if reaction_id.trim().is_empty() {
+        return Ok(());
+    }
+    let url = format!("{base_url}/open-apis/im/v1/messages/{message_id}/reactions/{reaction_id}");
+    let resp = http_client
+        .delete(&url)
+        .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .send()
+        .await
+        .map_err(|e| format!("Feishu delete_reaction failed: {e}"))?;
+    let resp_json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Feishu delete_reaction parse failed: {e}"))?;
+    let code = resp_json.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+    if code != 0 {
+        let msg = resp_json
+            .get("msg")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        return Err(format!(
+            "Feishu delete_reaction error: code={code} msg={msg}"
+        ));
     }
     Ok(())
 }
@@ -2642,42 +2822,6 @@ async fn handle_feishu_event(
         return;
     }
 
-    // Send ACK reaction (已读标记) — only when enabled in config
-    if feishu_cfg.ack_reaction {
-        let ack_http_client = http_client.clone();
-        let ack_base_url = base_url.to_string();
-        let ack_app_id = feishu_cfg.app_id.clone();
-        let ack_app_secret = feishu_cfg.app_secret.clone();
-        let ack_message_id = message_id.to_string();
-        let ack_text = text.clone();
-        tokio::spawn(async move {
-            // Send ACK reaction with locale-aware emoji
-            let emoji = random_feishu_ack_reaction(&ack_text);
-            let token = match get_token(
-                &ack_http_client,
-                &ack_base_url,
-                &ack_app_id,
-                &ack_app_secret,
-            )
-            .await
-            {
-                Ok(t) => t,
-                Err(_) => return,
-            };
-            if let Err(e) = send_feishu_reaction(
-                &ack_http_client,
-                &ack_base_url,
-                &token,
-                &ack_message_id,
-                emoji,
-            )
-            .await
-            {
-                warn!("Feishu: ACK reaction failed for {}: {}", ack_message_id, e);
-            }
-        });
-    }
-
     // Group mentions: direct @bot and @all are treated as mention signals.
     let mention_flags = if !is_dm {
         let mut flags = parse_feishu_mentions(
@@ -3049,6 +3193,28 @@ async fn handle_feishu_message(
         return;
     }
 
+    // 三段式状态表情: 收到 = receive(默认 OK) -> 干活 = working(默认 Typing)
+    // -> 完成 = done(默认 DONE)。Feishu 没有 edit reaction 的 API, 只能
+    // delete 旧的 + add 新的, 所以这里用一个 slot 记住当前那枚的 reaction_id。
+    let reaction_emoji = |opt: &Option<String>, fallback: &str| -> String {
+        opt.as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .unwrap_or(fallback)
+            .to_string()
+    };
+    let receive_emoji = reaction_emoji(&feishu_cfg.receive_reaction, FEISHU_DEFAULT_RECEIVE_REACTION);
+    let working_emoji = reaction_emoji(&feishu_cfg.working_reaction, FEISHU_DEFAULT_WORKING_REACTION);
+    let done_emoji = reaction_emoji(&feishu_cfg.done_reaction, FEISHU_DEFAULT_DONE_REACTION);
+    let reactions_on = feishu_cfg.ack_reaction && !message_id.is_empty();
+    let reaction_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    if reactions_on {
+        let id = feishu_add_reaction(&http_client, base_url, &token, message_id, &receive_emoji).await;
+        if let Ok(mut g) = reaction_slot.lock() {
+            *g = id;
+        }
+    }
+
     let feishu_chat_type = if is_dm { "private" } else { "group" };
     let turn_guard = match app_state
         .chat_turn_queue
@@ -3070,6 +3236,18 @@ async fn handle_feishu_message(
                 "Feishu: message queued (chat busy): chat_id={}, message_id={}",
                 chat_id, inbound_message_id
             );
+            // 消息只是排队, 还没开始干活: 把「收到」那枚撤掉, 避免它一直挂着。
+            if let Some(prev) = reaction_slot.lock().ok().and_then(|mut g| g.take()) {
+                let h = http_client.clone();
+                let b = base_url.to_string();
+                let t = token.clone();
+                let m = message_id.to_string();
+                tokio::spawn(async move {
+                    if let Err(e) = delete_feishu_reaction(&h, &b, &t, &m, &prev).await {
+                        warn!("Feishu: queued reaction cleanup failed: {e}");
+                    }
+                });
+            }
             return;
         }
     };
@@ -3080,6 +3258,36 @@ async fn handle_feishu_message(
         external_chat_id,
         inbound_text.chars().take(100).collect::<String>()
     );
+
+    if reactions_on {
+        // 真正开始干活了: 「收到」换成「干活中」。
+        feishu_swap_reaction(
+            &http_client,
+            base_url,
+            &token,
+            message_id,
+            &reaction_slot,
+            &working_emoji,
+        )
+        .await;
+    }
+    // 用 Drop 收尾: 无论 turn 是正常结束、提前 return 还是出错, 都会把
+    // 「干活中」换成「完成」, 不会给用户留一个永远转的状态。
+    let _reaction_guard = if reactions_on {
+        Some(FeishuReactionGuard {
+            http_client: http_client.clone(),
+            base_url: base_url.to_string(),
+            app_id: feishu_cfg.app_id.clone(),
+            app_secret: feishu_cfg.app_secret.clone(),
+            token: token.clone(),
+            token_at,
+            message_id: message_id.to_string(),
+            current: reaction_slot.clone(),
+            done_emoji,
+        })
+    } else {
+        None
+    };
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
 
@@ -4163,20 +4371,6 @@ accounts:
         let runtimes = build_feishu_runtime_contexts(&cfg);
         assert_eq!(runtimes.len(), 1);
         assert!(runtimes[0].config.topic_mode);
-    }
-
-    #[test]
-    fn pick_uniform_index_is_deterministic() {
-        let idx1 = pick_uniform_index(6, "hello");
-        let idx2 = pick_uniform_index(6, "hello");
-        assert_eq!(idx1, idx2);
-        assert!(idx1 < 6);
-    }
-
-    #[test]
-    fn random_feishu_ack_reaction_returns_valid_emoji() {
-        let emoji = random_feishu_ack_reaction("test message");
-        assert!(FEISHU_ACK_REACTIONS.contains(&emoji));
     }
 
     /// A turn whose last iteration only writes the answer must not end on a
