@@ -9,6 +9,7 @@ on:
     branches:
       - fix/feishu-progress-visible
       - fix/cancel-during-run
+      - fix/cline-response-format-header
   workflow_dispatch:
 
 permissions:
