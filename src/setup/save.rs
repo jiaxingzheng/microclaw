@@ -944,6 +944,10 @@ pub(crate) fn save_config_yaml(
     yaml.push_str("#   deepseek: { top_p: null, reasoning_effort: \"high\" }\n");
     yaml.push_str("# openai_compat_body_overrides_by_model:\n");
     yaml.push_str("#   gpt-5.2: { response_format: { type: \"json_object\" } }\n");
+    yaml.push_str("# Extra HTTP headers for OpenAI-compatible endpoints (optional).\n");
+    yaml.push_str("# Some gateways need a vendor flag to return a plain OpenAI body.\n");
+    yaml.push_str("# openai_compat_headers:\n");
+    yaml.push_str("#   X-Response-Format: openai\n");
 
     yaml.push('\n');
     yaml.push_str(&format!("data_dir: {}\n", yaml_double_quoted(&data_dir)));

@@ -72,6 +72,7 @@ At runtime, at least one channel must be enabled:
 | `openai_compat_body_overrides` | `{}` | Global request-body overrides for OpenAI-compatible providers (`openai`, `openrouter`, `deepseek`, `ollama`, etc.) |
 | `openai_compat_body_overrides_by_provider` | `{}` | Provider-specific OpenAI-compatible request-body overrides (keyed by provider name, case-insensitive) |
 | `openai_compat_body_overrides_by_model` | `{}` | Model-specific OpenAI-compatible request-body overrides (keyed by exact model name) |
+| `openai_compat_headers` | `{}` | Extra HTTP headers sent on every OpenAI-compatible LLM request (applied on top of `Content-Type`/`Authorization`; those two names are ignored). Needed by gateways that require a vendor flag, e.g. Cline's `X-Response-Format: openai` |
 | `data_dir` | `~/.microclaw` | Data root (`runtime` data in `data_dir/runtime`, skills in `data_dir/skills`) |
 | `working_dir` | `~/.microclaw/working_dir` | Default working directory for `bash/read_file/write_file/edit_file/glob/grep`; relative paths resolve from here |
 | `override_timezone` | unset | Optional IANA timezone override (for example `Asia/Shanghai`). Default behavior uses detected system timezone; override is applied only when this field is set. |

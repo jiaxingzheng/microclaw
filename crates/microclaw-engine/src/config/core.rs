@@ -322,6 +322,13 @@ pub struct Config {
     /// OpenAI-compatible request-body overrides keyed by model name.
     #[serde(default)]
     pub openai_compat_body_overrides_by_model: HashMap<String, HashMap<String, serde_json::Value>>,
+    /// Extra HTTP headers sent on every OpenAI-compatible LLM request, on top
+    /// of `Content-Type` and `Authorization`. Useful for gateways that need a
+    /// vendor-specific flag to emit a plain OpenAI body (e.g. Cline requires
+    /// `X-Response-Format: openai`, otherwise it wraps the reply in
+    /// `{"data":{...},"success":true}` and `choices` comes back empty).
+    #[serde(default)]
+    pub openai_compat_headers: HashMap<String, String>,
 
     // --- Paths & environment ---
     #[serde(default = "default_data_dir")]
@@ -1037,6 +1044,7 @@ impl Config {
             openai_compat_body_overrides: HashMap::new(),
             openai_compat_body_overrides_by_provider: HashMap::new(),
             openai_compat_body_overrides_by_model: HashMap::new(),
+            openai_compat_headers: HashMap::new(),
             web_enabled: true,
             web_host: "127.0.0.1".into(),
             web_port: 10961,

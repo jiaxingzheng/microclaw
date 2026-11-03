@@ -142,6 +142,7 @@ pub struct OpenAiProvider {
     openai_compat_body_overrides: HashMap<String, serde_json::Value>,
     openai_compat_body_overrides_by_provider: HashMap<String, HashMap<String, serde_json::Value>>,
     openai_compat_body_overrides_by_model: HashMap<String, HashMap<String, serde_json::Value>>,
+    openai_compat_headers: Vec<(String, String)>,
     chat_url: String,
     responses_url: String,
 }
@@ -223,6 +224,17 @@ impl OpenAiProvider {
             openai_compat_body_overrides_by_model: config
                 .openai_compat_body_overrides_by_model
                 .clone(),
+            openai_compat_headers: config
+                .openai_compat_headers
+                .iter()
+                .filter(|(name, value)| {
+                    !name.trim().is_empty()
+                        && !value.trim().is_empty()
+                        && !name.eq_ignore_ascii_case("authorization")
+                        && !name.eq_ignore_ascii_case("content-type")
+                })
+                .map(|(name, value)| (name.trim().to_string(), value.trim().to_string()))
+                .collect(),
             chat_url: format!("{}/chat/completions", base.trim_end_matches('/')),
             responses_url: format!("{}/responses", base.trim_end_matches('/')),
         }
@@ -707,10 +719,7 @@ impl LlmProvider for OpenAiProvider {
                 .post(&self.chat_url)
                 .header("Content-Type", "application/json")
                 .json(&body);
-            let api_key = self.key_pool.current();
-            if !api_key.trim().is_empty() {
-                req = req.header("Authorization", format!("Bearer {api_key}"));
-            }
+            req = self.with_compat_headers(req);
             let response = match req.send().await {
                 Ok(r) => r,
                 Err(e) if is_retryable_transport_error(&e) && retries < max_retries => {
@@ -889,10 +898,7 @@ impl LlmProvider for OpenAiProvider {
                 .post(&self.chat_url)
                 .header("Content-Type", "application/json")
                 .json(&body);
-            let api_key = self.key_pool.current();
-            if !api_key.trim().is_empty() {
-                req = req.header("Authorization", format!("Bearer {api_key}"));
-            }
+            req = self.with_compat_headers(req);
             let response = req.send().await?;
             let status = response.status();
             if status.is_success() {
@@ -1025,6 +1031,24 @@ impl LlmProvider for OpenAiProvider {
 }
 
 impl OpenAiProvider {
+    /// Attach the configured extra headers, then `Authorization`.
+    ///
+    /// Some OpenAI-compatible gateways need a vendor flag to emit a plain
+    /// OpenAI body. Cline, for example, wraps the reply in
+    /// `{"data":{...},"success":true}` unless the request carries
+    /// `X-Response-Format: openai`, which leaves `choices` empty and surfaces
+    /// as a bogus `(empty response)`.
+    fn with_compat_headers(&self, mut req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        for (name, value) in &self.openai_compat_headers {
+            req = req.header(name.as_str(), value.as_str());
+        }
+        let api_key = self.key_pool.current();
+        if !api_key.trim().is_empty() {
+            req = req.header("Authorization", format!("Bearer {api_key}"));
+        }
+        req
+    }
+
     async fn send_codex_message(
         &self,
         system: &str,
@@ -1077,10 +1101,7 @@ impl OpenAiProvider {
                 .post(&self.responses_url)
                 .header("Content-Type", "application/json")
                 .json(&body);
-            let api_key = self.key_pool.current();
-            if !api_key.trim().is_empty() {
-                req = req.header("Authorization", format!("Bearer {api_key}"));
-            }
+            req = self.with_compat_headers(req);
             if let Some(account_id) = self.codex_account_id.as_deref() {
                 if !account_id.trim().is_empty() {
                     req = req.header("ChatGPT-Account-ID", account_id);
@@ -2462,5 +2483,78 @@ data: [DONE]
             &translated.content[0],
             ResponseContentBlock::ToolUse { name, .. } if name == "read_file"
         ));
+    }
+
+    #[tokio::test]
+    async fn test_openai_compat_headers_reach_the_wire_and_cannot_override_auth() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel::<String>();
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let _ = tx.send(req);
+            let body = r#"{"choices":[{"finish_reason":"stop","index":0,"message":{"role":"assistant","content":"OK"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        });
+
+        let mut config = Config::test_defaults();
+        config.llm_provider = "openai".into();
+        config.api_key = "sk-real-key".into();
+        config.model = "cline-pass/test-model".into();
+        config.llm_base_url = Some(format!("http://{addr}/api/v1"));
+        config.openai_compat_headers = HashMap::from([
+            ("X-Response-Format".to_string(), "openai".to_string()),
+            // Must be ignored: auth and content type are owned by the provider.
+            ("Authorization".to_string(), "Bearer evil".to_string()),
+            ("Content-Type".to_string(), "text/plain".to_string()),
+        ]);
+        let provider = OpenAiProvider::new(&config);
+        let messages = vec![Message {
+            role: "user".into(),
+            content: MessageContent::Text("hi".into()),
+        }];
+        let _ = LlmProvider::send_message_with_model(&provider, "", messages, None, None).await;
+
+        let req = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        server.join().unwrap();
+        let lower = req.to_ascii_lowercase();
+
+        assert!(
+            lower.contains("x-response-format: openai"),
+            "vendor header missing from request: {req}"
+        );
+        assert!(
+            lower.contains("authorization: bearer sk-real-key"),
+            "Authorization must stay the provider's own key: {req}"
+        );
+        assert!(
+            !lower.contains("bearer evil"),
+            "configured Authorization must not override the real key: {req}"
+        );
+        assert_eq!(
+            lower.matches("content-type:").count(),
+            1,
+            "Content-Type must not be duplicated: {req}"
+        );
+        assert!(
+            lower.contains("content-type: application/json"),
+            "Content-Type must stay application/json: {req}"
+        );
     }
 }

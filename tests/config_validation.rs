@@ -70,6 +70,7 @@ fn minimal_config() -> Config {
         openai_compat_body_overrides: std::collections::HashMap::new(),
         openai_compat_body_overrides_by_provider: std::collections::HashMap::new(),
         openai_compat_body_overrides_by_model: std::collections::HashMap::new(),
+        openai_compat_headers: std::collections::HashMap::new(),
         web_enabled: false,
         web_host: "127.0.0.1".into(),
         web_port: 3900,

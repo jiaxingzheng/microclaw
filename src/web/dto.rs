@@ -177,6 +177,7 @@ pub(crate) struct UpdateConfigRequest {
         Option<HashMap<String, HashMap<String, serde_json::Value>>>,
     pub(crate) openai_compat_body_overrides_by_model:
         Option<HashMap<String, HashMap<String, serde_json::Value>>>,
+    pub(crate) openai_compat_headers: Option<HashMap<String, String>>,
     pub(crate) max_document_size_mb: Option<u64>,
     pub(crate) memory_token_budget: Option<usize>,
     pub(crate) embedding_provider: Option<Option<String>>,
